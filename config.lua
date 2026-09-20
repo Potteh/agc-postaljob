@@ -1,6 +1,8 @@
 Config = {}
 
 Config.Debug = true
+Config.VehicleLossMonitor = false
+Config.AutomaticRouteCleanup = false
 
 Config.RequireJob = false
 Config.JobName = 'postal'
