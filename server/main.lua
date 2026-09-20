@@ -1,6 +1,7 @@
 local QBCore = exports['qb-core']:GetCoreObject()
 
 local ActiveRoutes = {}
+local PendingRoutes = {}
 
 local function debugPrint(message)
     if Config.Debug then
@@ -9,8 +10,9 @@ local function debugPrint(message)
 end
 
 local function clearRoute(playerId)
-    if ActiveRoutes[playerId] then
+    if ActiveRoutes[playerId] or PendingRoutes[playerId] then
         ActiveRoutes[playerId] = nil
+        PendingRoutes[playerId] = nil
         debugPrint(('Route state cleared for player %s'):format(playerId))
     end
 end
@@ -53,6 +55,21 @@ local function deleteRouteVehicle(playerId, reason)
     local route = ActiveRoutes[playerId]
 
     if not route then
+        local pendingRoute = PendingRoutes[playerId]
+
+        if pendingRoute and pendingRoute.vehicle and pendingRoute.vehicle ~= 0 then
+            debugPrint(('DELETE PENDING POSTAL VEHICLE\nReason: %s\nPlayer: %s\nEntity: %s'):format(
+                reason,
+                playerId,
+                pendingRoute.vehicle
+            ))
+
+            if DoesEntityExist(pendingRoute.vehicle) then
+                DeleteEntity(pendingRoute.vehicle)
+            end
+        end
+
+        clearRoute(playerId)
         return
     end
 
@@ -71,28 +88,50 @@ local function deleteRouteVehicle(playerId, reason)
 end
 
 
-local function startVehicleDiagnostic(playerId, vehicle, vehicleNetId)
-    SetTimeout(5000, function()
-        local route = ActiveRoutes[playerId]
-        local exists = route
-            and route.vehicle == vehicle
-            and route.vehicleNetId == vehicleNetId
-            and DoesEntityExist(vehicle)
+local function failVehicleCreation(playerId, vehicle, message, debugMessage)
+    debugPrint(debugMessage)
 
-        debugPrint(('5-second vehicle check: %s player=%s entity=%s netId=%s'):format(
-            exists and 'EXISTS' or 'MISSING',
-            playerId,
-            vehicle,
-            vehicleNetId
-        ))
-    end)
+    if vehicle and vehicle ~= 0 and DoesEntityExist(vehicle) then
+        debugPrint(('Deleting failed postal entity: %s'):format(vehicle))
+        DeleteEntity(vehicle)
+    end
+
+    clearRoute(playerId)
+    TriggerClientEvent('acg_postal:client:routeDenied', playerId, message)
+end
+
+
+local function startVehicleDiagnostic(playerId, vehicle, vehicleNetId)
+    local checks = {
+        { delay = 1000, label = '1-second' },
+        { delay = 5000, label = '5-second' },
+        { delay = 10000, label = '10-second' },
+        { delay = 30000, label = '30-second' }
+    }
+
+    for _, check in ipairs(checks) do
+        local delay = check.delay
+        local label = check.label
+
+        SetTimeout(delay, function()
+            local exists = vehicle ~= 0 and DoesEntityExist(vehicle)
+
+            debugPrint(('%s SERVER check: %s entity=%s netId=%s player=%s'):format(
+                label,
+                exists and 'EXISTS' or 'MISSING',
+                vehicle,
+                vehicleNetId,
+                playerId
+            ))
+        end)
+    end
 end
 
 RegisterNetEvent('acg_postal:server:requestRoute', function()
     local src = source
     debugPrint(('Route requested by player %s'):format(src))
 
-    if ActiveRoutes[src] then
+    if ActiveRoutes[src] or PendingRoutes[src] then
         TriggerClientEvent('acg_postal:client:routeDenied', src, 'You already have an active postal route.')
         return
     end
@@ -113,26 +152,42 @@ RegisterNetEvent('acg_postal:server:requestRoute', function()
         return
     end
 
-    ActiveRoutes[src] = {
-        vehicle = 0,
-        vehicleNetId = 0,
-        plate = nil
+    PendingRoutes[src] = {
+        vehicle = 0
     }
 
     local spawn = Config.VehicleSpawn
     local model = joaat(Config.VehicleModel)
-    debugPrint(('Server creating postal vehicle for player %s'):format(src))
+    debugPrint('Creating vehicle with CreateVehicle')
+    debugPrint(('Model name: %s'):format(Config.VehicleModel))
+    debugPrint(('Model hash: %s'):format(model))
+    debugPrint(('Spawn: %.2f %.2f %.2f %.2f'):format(spawn.x, spawn.y, spawn.z, spawn.w))
 
-    local vehicle = CreateVehicleServerSetter(
+    if type(CreateVehicle) ~= 'function' then
+        debugPrint('ERROR: Server CreateVehicle native is unavailable in this artifact')
+        clearRoute(src)
+        TriggerClientEvent('acg_postal:client:routeDenied', src, 'This server artifact does not expose the server CreateVehicle native.')
+        return
+    end
+
+    local vehicle = CreateVehicle(
         model,
-        'automobile',
         spawn.x,
         spawn.y,
         spawn.z,
-        spawn.w
+        spawn.w,
+        true,
+        true
     )
 
-    debugPrint(('Server vehicle entity: %s'):format(vehicle))
+    debugPrint(('CreateVehicle returned entity: %s'):format(vehicle))
+    debugPrint(('DoesEntityExist immediately: %s'):format(vehicle ~= 0 and DoesEntityExist(vehicle) or false))
+
+    local entityTimeout = GetGameTimer() + 5000
+
+    while vehicle ~= 0 and not DoesEntityExist(vehicle) and GetGameTimer() < entityTimeout do
+        Wait(50)
+    end
 
     if vehicle == 0 or not DoesEntityExist(vehicle) then
         clearRoute(src)
@@ -140,49 +195,71 @@ RegisterNetEvent('acg_postal:server:requestRoute', function()
         return
     end
 
+    if not PendingRoutes[src] then
+        failVehicleCreation(
+            src,
+            vehicle,
+            'Postal vehicle creation was cancelled.',
+            'ERROR: Postal vehicle creation was cancelled before entity registration'
+        )
+        return
+    end
+
+    PendingRoutes[src].vehicle = vehicle
+
     SetEntityOrphanMode(vehicle, 2)
     SetEntityRoutingBucket(vehicle, GetPlayerRoutingBucket(src))
 
-    local plate = generatePlate()
-    SetVehicleNumberPlateText(vehicle, plate)
+    local vehicleNetId = 0
+    local networkTimeout = GetGameTimer() + 5000
+    debugPrint('Waiting for usable network ID...')
 
-    local vehicleNetId = NetworkGetNetworkIdFromEntity(vehicle)
-    local timeout = GetGameTimer() + 5000
+    while GetGameTimer() < networkTimeout do
+        if DoesEntityExist(vehicle) then
+            vehicleNetId = NetworkGetNetworkIdFromEntity(vehicle)
 
-    while vehicleNetId <= 0 and DoesEntityExist(vehicle) and GetGameTimer() < timeout do
-        Wait(50)
-
-        if not DoesEntityExist(vehicle) then
+            if vehicleNetId and vehicleNetId > 0 and vehicleNetId < 65534 then
+                break
+            end
+        else
             break
         end
 
-        vehicleNetId = NetworkGetNetworkIdFromEntity(vehicle)
+        Wait(50)
     end
 
-    if vehicleNetId <= 0 or not DoesEntityExist(vehicle) then
-        ActiveRoutes[src].vehicle = vehicle
-        deleteRouteVehicle(src, 'server failed to obtain a network ID')
-        TriggerClientEvent('acg_postal:client:routeDenied', src, 'The postal vehicle could not be networked by the server.')
+    if not vehicleNetId or vehicleNetId <= 0 or vehicleNetId >= 65534 or not DoesEntityExist(vehicle) then
+        failVehicleCreation(
+            src,
+            vehicle,
+            'The postal vehicle could not obtain a usable network ID.',
+            'ERROR: Postal vehicle failed to obtain usable network ID'
+        )
         return
     end
 
-    if not ActiveRoutes[src] or not GetPlayerName(src) then
-        ActiveRoutes[src] = {
-            vehicle = vehicle,
-            vehicleNetId = vehicleNetId,
-            plate = plate
-        }
-        deleteRouteVehicle(src, 'player disconnected during vehicle creation')
+    debugPrint(('Network ID: %s'):format(vehicleNetId))
+
+    if not PendingRoutes[src] or not GetPlayerName(src) then
+        failVehicleCreation(
+            src,
+            vehicle,
+            'Postal vehicle creation was cancelled.',
+            'ERROR: Postal vehicle creation was cancelled before route registration'
+        )
         return
     end
+
+    local plate = generatePlate()
+    SetVehicleNumberPlateText(vehicle, plate)
 
     ActiveRoutes[src] = {
         vehicle = vehicle,
         vehicleNetId = vehicleNetId,
         plate = plate
     }
+    PendingRoutes[src] = nil
 
-    debugPrint(('Server vehicle net ID: %s'):format(vehicleNetId))
     debugPrint(('Postal plate: %s'):format(plate))
     debugPrint(('Sending postal vehicle to player %s'):format(src))
     startVehicleDiagnostic(src, vehicle, vehicleNetId)
@@ -233,9 +310,17 @@ AddEventHandler('onResourceStop', function(resourceName)
     end
 
     local playerIds = {}
+    local seenPlayerIds = {}
 
     for playerId in pairs(ActiveRoutes) do
         playerIds[#playerIds + 1] = playerId
+        seenPlayerIds[playerId] = true
+    end
+
+    for playerId in pairs(PendingRoutes) do
+        if not seenPlayerIds[playerId] then
+            playerIds[#playerIds + 1] = playerId
+        end
     end
 
     for _, playerId in ipairs(playerIds) do

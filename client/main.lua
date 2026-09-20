@@ -162,14 +162,7 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
     onDuty = true
     routeRequestPending = false
 
-    SetVehicleHasBeenOwnedByPlayer(vehicle, true)
-    SetVehicleNeedsToBeHotwired(vehicle, false)
-    SetVehRadioStation(vehicle, 'OFF')
-    SetVehicleUndriveable(vehicle, false)
-    SetVehicleEngineOn(vehicle, true, true, false)
-    setVehicleFuel(vehicle)
-    giveVehicleKeys(vehicle, plate)
-    TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, -1)
+    debugPrint('Diagnostic mode: leaving the server-created vehicle untouched')
     startVehicleDiagnostic(vehicle, vehicleNetId)
 
     debugPrint(('Server postal vehicle resolved: entity=%s netId=%s plate=%s'):format(vehicle, vehicleNetId, plate))
