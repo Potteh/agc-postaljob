@@ -18,10 +18,6 @@ local deliveriesComplete = false
 local deliveryRequestPending = false
 local vehicleLostNotified = false
 
-local stagedTestRunning = false
-local stagedRouteApproval = nil
-local stagedVehicleRegistration = nil
-
 local carryAnimDict = 'anim@heists@box_carry@'
 local carryAnimName = 'idle'
 
@@ -29,33 +25,6 @@ local function debugPrint(message)
     if Config.Debug then
         print(('[acg_postal] %s'):format(message))
     end
-end
-
-local function logSuppressedCleanup(reason)
-    print(('[acg_postal DIAGNOSTIC] Would have cleared route: reason=%s'):format(reason))
-end
-
-local function normalStartTrace(step, message)
-    print(('[acg_postal] NORMAL START %02d - %s'):format(step, message))
-end
-
-local function traceNormalStartVehicleSurvival(vehicle)
-    CreateThread(function()
-        Wait(1000)
-        print(('[acg_postal] NORMAL START +1 SEC - vehicle exists=%s'):format(
-            tostring(DoesEntityExist(vehicle))
-        ))
-
-        Wait(4000)
-        print(('[acg_postal] NORMAL START +5 SEC - vehicle exists=%s'):format(
-            tostring(DoesEntityExist(vehicle))
-        ))
-
-        Wait(5000)
-        print(('[acg_postal] NORMAL START +10 SEC - vehicle exists=%s'):format(
-            tostring(DoesEntityExist(vehicle))
-        ))
-    end)
 end
 
 local function drawText3D(coords, text)
@@ -111,7 +80,6 @@ local function SetPostalVehicleFuel(vehicle)
         return false
     end
 
-    debugPrint('Postal vehicle fuel initialized to 100%')
     return true
 end
 
@@ -146,7 +114,6 @@ local function GivePostalVehicleKeys(vehicle, expectedPlate)
         return false
     end
 
-    debugPrint(('Postal vehicle keys assigned: %s'):format(expectedPlate))
     return true
 end
 
@@ -359,14 +326,6 @@ local function deleteClientRouteVehicle(reason)
         return
     end
 
-    NetworkRequestControlOfEntity(vehicle)
-    local timeout = GetGameTimer() + 1000
-
-    while DoesEntityExist(vehicle) and not NetworkHasControlOfEntity(vehicle) and GetGameTimer() < timeout do
-        NetworkRequestControlOfEntity(vehicle)
-        Wait(0)
-    end
-
     if type(QBCore.Functions.DeleteVehicle) == 'function' then
         local success, errorMessage = pcall(QBCore.Functions.DeleteVehicle, vehicle)
 
@@ -379,77 +338,96 @@ local function deleteClientRouteVehicle(reason)
 end
 
 local function failVehicleSpawn(message, reason)
-    if Config.AutomaticRouteCleanup == false then
-        logSuppressedCleanup(reason)
-    else
-        TriggerServerEvent('acg_postal:server:routeSpawnFailed')
-        deleteClientRouteVehicle(reason)
-        ClearRouteState(reason)
-    end
-
+    TriggerServerEvent('acg_postal:server:routeSpawnFailed')
+    deleteClientRouteVehicle(reason)
+    ClearRouteState(reason)
     QBCore.Functions.Notify(message, 'error')
 end
 
-local function spawnRouteVehicle()
-    normalStartTrace(2, 'spawning vehicle')
-
+local function SpawnPostalVehicle()
     if not isVehicleSpawnClear() then
         failVehicleSpawn('The postal vehicle spawn is blocked.', 'vehicle_spawn_blocked')
         return
     end
 
     local success, errorMessage = pcall(function()
-        QBCore.Functions.SpawnVehicle(Config.VehicleModel, function(vehicle)
+        QBCore.Functions.TriggerCallback('QBCore:Server:SpawnVehicle', function(netId)
+            if type(netId) ~= 'number' or netId <= 0 then
+                failVehicleSpawn('The postal vehicle could not be networked.', 'vehicle_network_id_failed')
+                return
+            end
+
+            local vehicle = 0
+            local timeout = GetGameTimer() + 5000
+
+            while GetGameTimer() < timeout do
+                vehicle = NetToVeh(netId)
+
+                if entityExists(vehicle) then
+                    break
+                end
+
+                Wait(50)
+            end
+
             if not entityExists(vehicle) then
                 failVehicleSpawn('The postal vehicle could not be spawned.', 'vehicle_spawn_failed')
                 return
             end
 
-            normalStartTrace(3, ('vehicle exists entity=%s'):format(vehicle))
             routeVehicle = vehicle
+            routeVehicleNetId = netId
+
+            debugPrint('QBCore server vehicle spawned')
+            debugPrint(('netId=%s'):format(netId))
+            debugPrint(('entity=%s'):format(vehicle))
+
             local plate = generatePostalPlate()
             SetVehicleNumberPlateText(vehicle, plate)
-            plate = NormalizePlate(QBCore.Functions.GetPlate(vehicle))
-            normalStartTrace(4, ('plate assigned plate=%s'):format(plate))
-
-            routeVehicleNetId = NetworkGetNetworkIdFromEntity(vehicle)
-
-            if not routeVehicleNetId or routeVehicleNetId <= 0 then
-                failVehicleSpawn('The postal vehicle could not be networked.', 'vehicle_network_id_failed')
-                return
-            end
-
+            plate = QBCore.Functions.GetPlate(vehicle)
             routeVehiclePlate = plate
-            SetNetworkIdCanMigrate(routeVehicleNetId, true)
-            normalStartTrace(5, ('network ID ready netId=%s migration=true'):format(routeVehicleNetId))
-            SetVehicleEngineOn(vehicle, true, true, false)
+
+            SetEntityHeading(vehicle, Config.VehicleSpawn.w)
+            SetVehicleColours(vehicle, 122, 122)
+            SetEntityAsMissionEntity(vehicle, true, true)
+            debugPrint(('mission entity=%s'):format(tostring(IsEntityAMissionEntity(vehicle))))
+            debugPrint(('plate=%s'):format(routeVehiclePlate))
+
             SetVehicleNeedsToBeHotwired(vehicle, false)
             SetVehicleHasBeenOwnedByPlayer(vehicle, true)
             SetVehRadioStation(vehicle, 'OFF')
-            normalStartTrace(6, 'vehicle natives complete')
+
             local fuelInitialized = SetPostalVehicleFuel(vehicle)
-            normalStartTrace(7, ('fuel complete success=%s'):format(tostring(fuelInitialized)))
-            local keysAssigned = GivePostalVehicleKeys(vehicle, plate)
-            normalStartTrace(8, ('keys complete success=%s'):format(tostring(keysAssigned)))
+
+            if fuelInitialized then
+                debugPrint('fuel initialized')
+            end
+
             TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, -1)
             Wait(250)
 
             local enteredVehicle = GetVehiclePedIsIn(PlayerPedId(), false) == vehicle
-            debugPrint(('Player successfully entered postal vehicle: %s'):format(tostring(enteredVehicle)))
-            normalStartTrace(9, ('player warp complete entered=%s'):format(tostring(enteredVehicle)))
+            local keysAssigned = GivePostalVehicleKeys(vehicle, routeVehiclePlate)
+
+            if keysAssigned then
+                debugPrint('keys assigned')
+            end
+
+            SetVehicleEngineOn(vehicle, true, true)
+
+            if enteredVehicle then
+                debugPrint('player entered vehicle')
+            else
+                debugPrint('ERROR: Player did not enter postal vehicle')
+            end
 
             onDuty = true
-            normalStartTrace(10, 'onDuty=true')
-            debugPrint('Postal vehicle spawned')
-            debugPrint(('Postal vehicle net ID: %s'):format(routeVehicleNetId))
-            debugPrint(('Postal vehicle plate: %s'):format(routeVehiclePlate))
-            normalStartTrace(11, 'registering vehicle with postal server')
             TriggerServerEvent(
                 'acg_postal:server:registerRouteVehicle',
                 routeVehicleNetId,
                 routeVehiclePlate
             )
-        end, Config.VehicleSpawn, true, false)
+        end, Config.VehicleModel, Config.VehicleSpawn, true)
     end)
 
     if not success then
@@ -506,82 +484,41 @@ local function requestVehicleReturn()
 end
 
 RegisterNetEvent('acg_postal:client:routeApproved', function()
-    if stagedTestRunning then
-        stagedRouteApproval = true
-        return
-    end
-
     if not routeRequestPending or onDuty then
         return
     end
 
-    normalStartTrace(1, 'route approved')
     debugPrint('Route approved')
-    spawnRouteVehicle()
+    SpawnPostalVehicle()
 end)
 
 RegisterNetEvent('acg_postal:client:routeVehicleRegistered', function(vehicleNetId, plate)
-    if stagedTestRunning then
-        stagedVehicleRegistration = true
-        return
-    end
-
     if not onDuty or vehicleNetId ~= routeVehicleNetId or NormalizePlate(plate) ~= routeVehiclePlate then
         return
     end
 
     routeRequestPending = false
-    normalStartTrace(12, 'server registration complete')
 
     if not generateRouteStops() then
-        if Config.AutomaticRouteCleanup == false then
-            logSuppressedCleanup('route_generation_failed')
-        else
-            TriggerServerEvent('acg_postal:server:cancelRoute', 'route_generation_failed')
-            deleteClientRouteVehicle('route_generation_failed')
-            ClearRouteState('route_generation_failed')
-        end
-
+        TriggerServerEvent('acg_postal:server:cancelRoute', 'route_generation_failed')
+        deleteClientRouteVehicle('route_generation_failed')
+        ClearRouteState('route_generation_failed')
         QBCore.Functions.Notify('No postal delivery locations are configured.', 'error')
         return
     end
 
-    normalStartTrace(13, ('route generated stops=%s'):format(#routeStops))
     setCurrentDeliveryBlip()
-    normalStartTrace(14, 'GPS created')
-    normalStartTrace(15, 'startup complete')
-    traceNormalStartVehicleSurvival(routeVehicle)
+    debugPrint('route started')
     QBCore.Functions.Notify('Postal route started. Follow the GPS to your first delivery.', 'success')
 end)
 
 RegisterNetEvent('acg_postal:client:routeVehicleRegistrationFailed', function(message)
-    if stagedTestRunning then
-        stagedVehicleRegistration = false
-        print(('[acg_postal STAGE 7] Server registration failed: %s'):format(
-            message or 'unknown registration error'
-        ))
-        return
-    end
-
-    if Config.AutomaticRouteCleanup == false then
-        logSuppressedCleanup('vehicle_registration_failed')
-    else
-        deleteClientRouteVehicle('vehicle_registration_failed')
-        ClearRouteState('vehicle_registration_failed')
-    end
-
+    deleteClientRouteVehicle('vehicle_registration_failed')
+    ClearRouteState('vehicle_registration_failed')
     QBCore.Functions.Notify(message or 'The postal vehicle could not be registered.', 'error')
 end)
 
 RegisterNetEvent('acg_postal:client:routeDenied', function(message)
-    if stagedTestRunning then
-        stagedRouteApproval = false
-        print(('[acg_postal STAGES] Server route preflight failed: %s'):format(
-            message or 'unknown route error'
-        ))
-        return
-    end
-
     routeRequestPending = false
     QBCore.Functions.Notify(message or 'The postal route could not be started.', 'error')
 end)
@@ -787,265 +724,3 @@ AddEventHandler('onResourceStop', function(resourceName)
     deleteClientRouteVehicle('resource_stopping')
     ClearRouteState('resource_stopping')
 end)
-
-local function runBareVehicleTest(modelName, displayName)
-    CreateThread(function()
-        local model = joaat(modelName)
-        RequestModel(model)
-        local timeout = GetGameTimer() + 10000
-
-        while not HasModelLoaded(model) and GetGameTimer() < timeout do
-            Wait(50)
-        end
-
-        if not HasModelLoaded(model) then
-            print(('[acg_postal TEST] Failed to load %s'):format(displayName))
-            return
-        end
-
-        local ped = PlayerPedId()
-        local spawnCoords = GetOffsetFromEntityInWorldCoords(ped, 0.0, 5.0, 0.0)
-        local heading = GetEntityHeading(ped)
-        local vehicle = CreateVehicle(
-            model,
-            spawnCoords.x,
-            spawnCoords.y,
-            spawnCoords.z,
-            heading,
-            true,
-            false
-        )
-        local isolatedTestVehicle = vehicle
-
-        print(('[acg_postal TEST] Bare %s created entity=%s'):format(displayName, isolatedTestVehicle))
-
-        local lastExists = DoesEntityExist(isolatedTestVehicle)
-        print(('[acg_postal TEST] t=0 vehicle exists=%s'):format(tostring(lastExists)))
-
-        for elapsed = 1, 30 do
-            Wait(1000)
-
-            local exists = DoesEntityExist(isolatedTestVehicle)
-
-            if exists ~= lastExists then
-                print(('[acg_postal TEST] t=%s vehicle exists=%s'):format(elapsed, tostring(exists)))
-                lastExists = exists
-            end
-        end
-    end)
-end
-
-RegisterCommand('testpostalvan', function()
-    runBareVehicleTest('boxville2', 'Boxville')
-end, false)
-
-RegisterCommand('testpostalcar', function()
-    runBareVehicleTest('adder', 'Adder')
-end, false)
-
-local function observeStagedVehicle(stage, vehicle, playerMustBeInside, failureMessage)
-    Wait(5000)
-
-    if not DoesEntityExist(vehicle) then
-        print(('[acg_postal STAGE %s] %s'):format(stage, failureMessage or 'FAILED'))
-        return false
-    end
-
-    if playerMustBeInside and GetVehiclePedIsIn(PlayerPedId(), false) ~= vehicle then
-        print(('[acg_postal STAGE %s] FAILED - player is no longer in the postal vehicle'):format(stage))
-        return false
-    end
-
-    print(('[acg_postal STAGE %s] PASSED'):format(stage))
-    return true
-end
-
-RegisterCommand('testpostalstages', function()
-    if stagedTestRunning then
-        print('[acg_postal STAGES] A staged test is already running')
-        return
-    end
-
-    if onDuty or routeRequestPending then
-        print('[acg_postal STAGES] Cannot start while a normal postal route is active or pending')
-        return
-    end
-
-    CreateThread(function()
-        stagedTestRunning = true
-        stagedRouteApproval = nil
-        stagedVehicleRegistration = nil
-
-        -- The real registration handler requires the same server route state created by normal startup.
-        TriggerServerEvent('acg_postal:server:requestRoute')
-        local approvalTimeout = GetGameTimer() + 5000
-
-        while stagedRouteApproval == nil and GetGameTimer() < approvalTimeout do
-            Wait(50)
-        end
-
-        if stagedRouteApproval ~= true then
-            print('[acg_postal STAGES] STOPPED - normal server route preflight was not approved')
-            stagedTestRunning = false
-            return
-        end
-
-        local model = joaat('boxville2')
-        RequestModel(model)
-        local timeout = GetGameTimer() + 10000
-
-        while not HasModelLoaded(model) and GetGameTimer() < timeout do
-            Wait(50)
-        end
-
-        if not HasModelLoaded(model) then
-            print('[acg_postal STAGE 0] FAILED')
-            stagedTestRunning = false
-            return
-        end
-
-        local ped = PlayerPedId()
-        local spawnCoords = GetOffsetFromEntityInWorldCoords(ped, 0.0, 5.0, 0.0)
-        local heading = GetEntityHeading(ped)
-        local vehicle = CreateVehicle(
-            model,
-            spawnCoords.x,
-            spawnCoords.y,
-            spawnCoords.z,
-            heading,
-            true,
-            false
-        )
-        local isolatedTestVehicle = vehicle
-
-        print(('[acg_postal STAGE 0] Bare vehicle created entity=%s'):format(isolatedTestVehicle))
-
-        if not observeStagedVehicle(0, vehicle, false, 'FAILED') then
-            stagedTestRunning = false
-            return
-        end
-
-        local plate = 'POSTAL99'
-        print('[acg_postal STAGE 1] Setting plate')
-        SetVehicleNumberPlateText(vehicle, plate)
-
-        if not observeStagedVehicle(1, vehicle, false, 'FAILED - vehicle disappeared after plate assignment') then
-            stagedTestRunning = false
-            return
-        end
-
-        print('[acg_postal STAGE 2] SetVehicleEngineOn')
-        SetVehicleEngineOn(vehicle, true, true, false)
-        print('[acg_postal STAGE 2] SetVehicleNeedsToBeHotwired')
-        SetVehicleNeedsToBeHotwired(vehicle, false)
-        print('[acg_postal STAGE 2] SetVehicleHasBeenOwnedByPlayer')
-        SetVehicleHasBeenOwnedByPlayer(vehicle, true)
-        print('[acg_postal STAGE 2] SetVehRadioStation')
-        SetVehRadioStation(vehicle, 'OFF')
-
-        if not observeStagedVehicle(2, vehicle, false, 'FAILED') then
-            stagedTestRunning = false
-            return
-        end
-
-        print('[acg_postal STAGE 3] Calling qb-fuel')
-        SetPostalVehicleFuel(vehicle)
-
-        if not observeStagedVehicle(3, vehicle, false, 'FAILED') then
-            stagedTestRunning = false
-            return
-        end
-
-        print('[acg_postal STAGE 4] Calling qb-vehiclekeys')
-        GivePostalVehicleKeys(vehicle, plate)
-
-        if not observeStagedVehicle(4, vehicle, false, 'FAILED') then
-            stagedTestRunning = false
-            return
-        end
-
-        local netId = NetworkGetNetworkIdFromEntity(vehicle)
-        print(('[acg_postal STAGE 5] netId=%s'):format(netId))
-        print('[acg_postal STAGE 5] SetNetworkIdCanMigrate')
-        SetNetworkIdCanMigrate(netId, true)
-
-        if not observeStagedVehicle(5, vehicle, false, 'FAILED') then
-            stagedTestRunning = false
-            return
-        end
-
-        TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, -1)
-        Wait(1000)
-
-        local pedVehicle = GetVehiclePedIsIn(PlayerPedId(), false)
-        print(('[acg_postal STAGE 6] playerVehicle=%s postalVehicle=%s match=%s'):format(
-            pedVehicle,
-            vehicle,
-            tostring(pedVehicle == vehicle)
-        ))
-
-        if not DoesEntityExist(vehicle) then
-            print('[acg_postal STAGE 6] FAILED')
-            stagedTestRunning = false
-            return
-        end
-
-        if pedVehicle ~= vehicle then
-            print('[acg_postal STAGE 6] FAILED - player did not enter the postal vehicle')
-            stagedTestRunning = false
-            return
-        end
-
-        if not observeStagedVehicle(6, vehicle, true, 'FAILED') then
-            stagedTestRunning = false
-            return
-        end
-
-        print('[acg_postal STAGE 7] Registering vehicle with postal server')
-        TriggerServerEvent('acg_postal:server:registerRouteVehicle', netId, plate)
-        Wait(5000)
-
-        if not DoesEntityExist(vehicle) then
-            print('[acg_postal STAGE 7] FAILED')
-            stagedTestRunning = false
-            return
-        end
-
-        if GetVehiclePedIsIn(PlayerPedId(), false) ~= vehicle then
-            print('[acg_postal STAGE 7] FAILED - player is no longer in the postal vehicle')
-            stagedTestRunning = false
-            return
-        end
-
-        if stagedVehicleRegistration ~= true then
-            print('[acg_postal STAGE 7] FAILED - postal server did not confirm vehicle registration')
-            stagedTestRunning = false
-            return
-        end
-
-        print('[acg_postal STAGE 7] PASSED')
-
-        print('[acg_postal STAGE 8] Generating route')
-
-        if not generateRouteStops() then
-            print('[acg_postal STAGE 8] FAILED - route generation returned false')
-            stagedTestRunning = false
-            return
-        end
-
-        if not observeStagedVehicle(8, vehicle, true, 'FAILED') then
-            stagedTestRunning = false
-            return
-        end
-
-        print('[acg_postal STAGE 9] Creating first delivery GPS')
-        setCurrentDeliveryBlip()
-
-        if not observeStagedVehicle(9, vehicle, true, 'FAILED') then
-            stagedTestRunning = false
-            return
-        end
-
-        stagedTestRunning = false
-    end)
-end, false)

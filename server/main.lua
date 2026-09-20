@@ -19,18 +19,6 @@ local function clearRoute(playerId, reason)
     end
 end
 
-local function clearRouteAutomatically(playerId, reason)
-    if Config.AutomaticRouteCleanup == false then
-        print(('[acg_postal DIAGNOSTIC] Would have cleared route: player=%s reason=%s'):format(
-            playerId,
-            reason
-        ))
-        return
-    end
-
-    clearRoute(playerId, reason)
-end
-
 local function hasRequiredJob(player)
     if not Config.RequireJob then
         return true
@@ -104,13 +92,13 @@ RegisterNetEvent('acg_postal:server:registerRouteVehicle', function(vehicleNetId
     end
 
     if type(vehicleNetId) ~= 'number' or vehicleNetId <= 0 or vehicleNetId % 1 ~= 0 then
-        clearRouteAutomatically(src, 'invalid_vehicle_network_id')
+        clearRoute(src, 'invalid_vehicle_network_id')
         TriggerClientEvent('acg_postal:client:routeVehicleRegistrationFailed', src, 'The postal vehicle has an invalid network ID.')
         return
     end
 
     if not isValidPostalPlate(plate) then
-        clearRouteAutomatically(src, 'invalid_vehicle_plate')
+        clearRoute(src, 'invalid_vehicle_plate')
         TriggerClientEvent('acg_postal:client:routeVehicleRegistrationFailed', src, 'The postal vehicle has an invalid plate.')
         return
     end
@@ -124,7 +112,7 @@ RegisterNetEvent('acg_postal:server:registerRouteVehicle', function(vehicleNetId
 end)
 
 RegisterNetEvent('acg_postal:server:routeSpawnFailed', function()
-    clearRouteAutomatically(source, 'client_vehicle_spawn_failed')
+    clearRoute(source, 'client_vehicle_spawn_failed')
 end)
 
 RegisterNetEvent('acg_postal:server:cancelRoute', function(reason)
@@ -133,11 +121,7 @@ RegisterNetEvent('acg_postal:server:cancelRoute', function(reason)
         explicit_player_cancellation = true
     }
     local clearReason = allowedReasons[reason] and reason or 'client_requested_route_cancel'
-    if clearReason == 'explicit_player_cancellation' then
-        clearRoute(source, clearReason)
-    else
-        clearRouteAutomatically(source, clearReason)
-    end
+    clearRoute(source, clearReason)
 end)
 
 RegisterNetEvent('acg_postal:server:completeDelivery', function(stopNumber)
@@ -208,7 +192,7 @@ RegisterNetEvent('acg_postal:server:returnVehicle', function(vehicleNetId, plate
 end)
 
 AddEventHandler('playerDropped', function()
-    clearRouteAutomatically(source, 'player_dropped')
+    clearRoute(source, 'player_dropped')
 end)
 
 AddEventHandler('onResourceStop', function(resourceName)

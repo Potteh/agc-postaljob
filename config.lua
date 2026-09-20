@@ -2,7 +2,6 @@ Config = {}
 
 Config.Debug = true
 Config.VehicleLossMonitor = false
-Config.AutomaticRouteCleanup = false
 
 Config.RequireJob = false
 Config.JobName = 'postal'
@@ -20,7 +19,7 @@ Config.InteractionDistance = 2.0
 Config.VehicleSpawnClearance = 3.0
 Config.VehicleFuelLevel = 100.0
 
-Config.DeliveriesPerRoute = 10
+Config.DeliveriesPerRoute = 3
 
 Config.DeliveryArrivalDistance = 35.0
 Config.PackagePickupDistance = 2.0
