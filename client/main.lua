@@ -6,6 +6,7 @@ local routeVehicleNetId = nil
 
 local routeRequestPending = false
 local returnRequestPending = false
+local routeVehicleRegistered = false
 
 local function debugPrint(message)
     if Config.Debug then
@@ -78,12 +79,18 @@ local function requestControl(entity)
     return NetworkHasControlOfEntity(entity)
 end
 
-local function deleteRouteVehicle()
+local function deleteRouteVehicle(reason)
     local vehicle = routeVehicle
 
-    if (not vehicle or not DoesEntityExist(vehicle)) and routeVehicleNetId then
+    if (not vehicle or not DoesEntityExist(vehicle)) and routeVehicleNetId and routeVehicleNetId > 0 then
         vehicle = NetworkGetEntityFromNetworkId(routeVehicleNetId)
     end
+
+    debugPrint(('DELETE VEHICLE requested\nReason: %s\nEntity: %s\nNetwork ID: %s'):format(
+        reason,
+        vehicle or 'not found',
+        routeVehicleNetId or 'not assigned'
+    ))
 
     if vehicle and DoesEntityExist(vehicle) then
         requestControl(vehicle)
@@ -102,6 +109,7 @@ local function clearRouteState()
     routeVehicleNetId = nil
     routeRequestPending = false
     returnRequestPending = false
+    routeVehicleRegistered = false
     debugPrint('Route state cleared')
 end
 
@@ -109,6 +117,42 @@ local function failRouteStart(message)
     TriggerServerEvent('acg_postal:server:cancelRoute')
     clearRouteState()
     QBCore.Functions.Notify(message, 'error')
+end
+
+local function waitForVehicleNetwork(vehicle)
+    local timeout = GetGameTimer() + 5000
+
+    debugPrint('Waiting for network registration...')
+
+    while DoesEntityExist(vehicle) and not NetworkGetEntityIsNetworked(vehicle) and GetGameTimer() < timeout do
+        NetworkRegisterEntityAsNetworked(vehicle)
+        Wait(50)
+    end
+
+    if not DoesEntityExist(vehicle) then
+        return nil
+    end
+
+    local isNetworked = NetworkGetEntityIsNetworked(vehicle)
+    debugPrint(('Vehicle networked: %s'):format(isNetworked))
+
+    if not isNetworked then
+        return nil
+    end
+
+    local networkId = NetworkGetNetworkIdFromEntity(vehicle)
+    local networkIdTimeout = GetGameTimer() + 5000
+
+    while networkId <= 0 and DoesEntityExist(vehicle) and GetGameTimer() < networkIdTimeout do
+        Wait(50)
+        networkId = NetworkGetNetworkIdFromEntity(vehicle)
+    end
+
+    if networkId <= 0 then
+        return nil
+    end
+
+    return networkId
 end
 
 local function spawnRouteVehicle()
@@ -145,25 +189,38 @@ local function spawnRouteVehicle()
         return
     end
 
+    routeVehicle = vehicle
+    debugPrint(('Vehicle entity created: %s'):format(vehicle))
     SetEntityAsMissionEntity(vehicle, true, true)
     SetVehicleOnGroundProperly(vehicle)
+
+    local networkId = waitForVehicleNetwork(vehicle)
+
+    if not networkId then
+        deleteRouteVehicle('network registration timed out after spawn')
+        failRouteStart('The postal vehicle could not be networked.')
+        return
+    end
+
+    routeVehicleNetId = networkId
+    SetNetworkIdCanMigrate(routeVehicleNetId, true)
+    debugPrint(('Vehicle network ID: %s'):format(routeVehicleNetId))
 
     local plate = generatePlate()
     SetVehicleNumberPlateText(vehicle, plate)
     setVehicleFuel(vehicle)
 
-    routeVehicle = vehicle
-    routeVehicleNetId = NetworkGetNetworkIdFromEntity(vehicle)
-    SetNetworkIdCanMigrate(routeVehicleNetId, true)
     onDuty = true
     routeRequestPending = false
 
+    SetVehicleUndriveable(vehicle, false)
+    SetVehicleEngineOn(vehicle, true, true, false)
     TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, -1)
     giveVehicleKeys(vehicle, plate)
+    debugPrint('Registering route vehicle with server')
     TriggerServerEvent('acg_postal:server:registerVehicle', routeVehicleNetId)
 
     debugPrint(('Vehicle spawned with plate %s'):format(plate))
-    debugPrint(('Vehicle network ID: %s'):format(routeVehicleNetId))
     QBCore.Functions.Notify('Postal route started. Return the vehicle to this depot when finished.', 'success')
 end
 
@@ -184,7 +241,12 @@ local function requestRoute()
 end
 
 local function requestVehicleReturn()
-    if returnRequestPending or not routeVehicleNetId then
+    if returnRequestPending then
+        return
+    end
+
+    if not routeVehicleRegistered or not routeVehicleNetId then
+        QBCore.Functions.Notify('The postal vehicle is still being registered. Try again shortly.', 'error')
         return
     end
 
@@ -228,12 +290,47 @@ RegisterNetEvent('acg_postal:client:routeDenied', function(message)
     QBCore.Functions.Notify(message or 'The postal route could not be started.', 'error')
 end)
 
-RegisterNetEvent('acg_postal:client:returnApproved', function()
+RegisterNetEvent('acg_postal:client:vehicleRegistered', function(vehicleNetId)
+    if not onDuty or vehicleNetId ~= routeVehicleNetId then
+        return
+    end
+
+    routeVehicleRegistered = true
+    debugPrint('Route vehicle registration complete')
+end)
+
+RegisterNetEvent('acg_postal:client:vehicleRegistrationFailed', function(vehicleNetId, message)
+    if vehicleNetId ~= routeVehicleNetId then
+        debugPrint(('Ignored registration failure for network ID %s; active network ID is %s'):format(
+            vehicleNetId or 'not assigned',
+            routeVehicleNetId or 'not assigned'
+        ))
+        return
+    end
+
+    if routeVehicle and DoesEntityExist(routeVehicle) then
+        deleteRouteVehicle('server rejected route vehicle registration')
+    end
+
+    clearRouteState()
+    QBCore.Functions.Notify(message or 'The postal vehicle could not be registered.', 'error')
+end)
+
+RegisterNetEvent('acg_postal:client:returnApproved', function(vehicleNetId)
     if not onDuty or not returnRequestPending then
         return
     end
 
-    deleteRouteVehicle()
+    if vehicleNetId ~= routeVehicleNetId then
+        returnRequestPending = false
+        debugPrint(('Ignored return approval for network ID %s; active network ID is %s'):format(
+            vehicleNetId,
+            routeVehicleNetId or 'not assigned'
+        ))
+        return
+    end
+
+    deleteRouteVehicle('server approved intentional vehicle return')
     debugPrint('Vehicle returned')
     clearRouteState()
     QBCore.Functions.Notify('Postal vehicle returned.', 'success')
@@ -279,6 +376,6 @@ AddEventHandler('onResourceStop', function(resourceName)
         return
     end
 
-    deleteRouteVehicle()
+    deleteRouteVehicle('acg_postal resource stopped')
     clearRouteState()
 end)

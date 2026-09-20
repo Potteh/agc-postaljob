@@ -56,18 +56,30 @@ RegisterNetEvent('acg_postal:server:registerVehicle', function(vehicleNetId)
     local src = source
     local route = activeRoutes[src]
 
-    if not route or route.vehicleNetId ~= nil then
+    if not route then
+        TriggerClientEvent('acg_postal:client:vehicleRegistrationFailed', src, vehicleNetId, 'The server no longer has an active postal route.')
         return
     end
 
     if type(vehicleNetId) ~= 'number' or vehicleNetId <= 0 then
         clearRoute(src)
-        TriggerClientEvent('acg_postal:client:routeDenied', src, 'The postal vehicle could not be registered.')
+        TriggerClientEvent('acg_postal:client:vehicleRegistrationFailed', src, vehicleNetId, 'The postal vehicle has an invalid network ID.')
+        return
+    end
+
+    if route.vehicleNetId then
+        if route.vehicleNetId == vehicleNetId then
+            TriggerClientEvent('acg_postal:client:vehicleRegistered', src, vehicleNetId)
+        else
+            TriggerClientEvent('acg_postal:client:vehicleRegistrationFailed', src, vehicleNetId, 'A different postal vehicle is already registered.')
+        end
+
         return
     end
 
     route.vehicleNetId = vehicleNetId
     debugPrint(('Registered vehicle network ID %s for player %s'):format(vehicleNetId, src))
+    TriggerClientEvent('acg_postal:client:vehicleRegistered', src, vehicleNetId)
 end)
 
 RegisterNetEvent('acg_postal:server:cancelRoute', function()
@@ -101,7 +113,7 @@ RegisterNetEvent('acg_postal:server:returnVehicle', function(vehicleNetId)
 
     clearRoute(src)
     debugPrint(('Vehicle returned by player %s (network ID %s)'):format(src, vehicleNetId))
-    TriggerClientEvent('acg_postal:client:returnApproved', src)
+    TriggerClientEvent('acg_postal:client:returnApproved', src, vehicleNetId)
 end)
 
 AddEventHandler('playerDropped', function()
