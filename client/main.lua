@@ -696,3 +696,58 @@ AddEventHandler('onResourceStop', function(resourceName)
     deleteClientRouteVehicle('resource_stopping')
     ClearRouteState('resource_stopping')
 end)
+
+local function runBareVehicleTest(modelName, displayName)
+    CreateThread(function()
+        local model = joaat(modelName)
+        RequestModel(model)
+        local timeout = GetGameTimer() + 10000
+
+        while not HasModelLoaded(model) and GetGameTimer() < timeout do
+            Wait(50)
+        end
+
+        if not HasModelLoaded(model) then
+            print(('[acg_postal TEST] Failed to load %s'):format(displayName))
+            return
+        end
+
+        local ped = PlayerPedId()
+        local spawnCoords = GetOffsetFromEntityInWorldCoords(ped, 0.0, 5.0, 0.0)
+        local heading = GetEntityHeading(ped)
+        local vehicle = CreateVehicle(
+            model,
+            spawnCoords.x,
+            spawnCoords.y,
+            spawnCoords.z,
+            heading,
+            true,
+            false
+        )
+        local isolatedTestVehicle = vehicle
+
+        print(('[acg_postal TEST] Bare %s created entity=%s'):format(displayName, isolatedTestVehicle))
+
+        local lastExists = DoesEntityExist(isolatedTestVehicle)
+        print(('[acg_postal TEST] t=0 vehicle exists=%s'):format(tostring(lastExists)))
+
+        for elapsed = 1, 30 do
+            Wait(1000)
+
+            local exists = DoesEntityExist(isolatedTestVehicle)
+
+            if exists ~= lastExists then
+                print(('[acg_postal TEST] t=%s vehicle exists=%s'):format(elapsed, tostring(exists)))
+                lastExists = exists
+            end
+        end
+    end)
+end
+
+RegisterCommand('testpostalvan', function()
+    runBareVehicleTest('boxville2', 'Boxville')
+end, false)
+
+RegisterCommand('testpostalcar', function()
+    runBareVehicleTest('adder', 'Adder')
+end, false)
