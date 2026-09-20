@@ -9,11 +9,15 @@ local function debugPrint(message)
     end
 end
 
-local function clearRoute(playerId)
+local function clearRoute(playerId, reason)
+    if not reason then
+        error('clearRoute requires a reason')
+    end
+
     if ActiveRoutes[playerId] or PendingRoutes[playerId] then
         ActiveRoutes[playerId] = nil
         PendingRoutes[playerId] = nil
-        debugPrint(('Route state cleared for player %s'):format(playerId))
+        debugPrint(('Server route state cleared player=%s reason=%s'):format(playerId, reason))
     end
 end
 
@@ -51,6 +55,22 @@ local function isVehicleSpawnClear()
 end
 
 
+local function DeletePostalVehicle(vehicle, vehicleNetId, reason)
+    local exists = vehicle ~= nil and vehicle ~= 0 and DoesEntityExist(vehicle)
+
+    debugPrint(('SERVER DELETE POSTAL VEHICLE\nreason=%s\nentity=%s\nnetId=%s\nexists=%s'):format(
+        tostring(reason),
+        tostring(vehicle),
+        tostring(vehicleNetId),
+        tostring(exists)
+    ))
+
+    if exists then
+        DeleteEntity(vehicle)
+    end
+end
+
+
 local function deleteRouteVehicle(playerId, reason)
     local route = ActiveRoutes[playerId]
 
@@ -58,45 +78,24 @@ local function deleteRouteVehicle(playerId, reason)
         local pendingRoute = PendingRoutes[playerId]
 
         if pendingRoute and pendingRoute.vehicle and pendingRoute.vehicle ~= 0 then
-            debugPrint(('DELETE PENDING POSTAL VEHICLE\nReason: %s\nPlayer: %s\nEntity: %s'):format(
-                reason,
-                playerId,
-                pendingRoute.vehicle
-            ))
-
-            if DoesEntityExist(pendingRoute.vehicle) then
-                DeleteEntity(pendingRoute.vehicle)
-            end
+            DeletePostalVehicle(pendingRoute.vehicle, 0, reason)
         end
 
-        clearRoute(playerId)
+        clearRoute(playerId, reason)
         return
     end
 
-    debugPrint(('DELETE POSTAL VEHICLE\nReason: %s\nPlayer: %s\nEntity: %s\nNetwork ID: %s'):format(
-        reason,
-        playerId,
-        route.vehicle or 'not assigned',
-        route.vehicleNetId or 'not assigned'
-    ))
-
-    if route.vehicle and route.vehicle ~= 0 and DoesEntityExist(route.vehicle) then
-        DeleteEntity(route.vehicle)
-    end
-
-    clearRoute(playerId)
+    DeletePostalVehicle(route.vehicle, route.vehicleNetId, reason)
+    clearRoute(playerId, reason)
 end
 
 
 local function failVehicleCreation(playerId, vehicle, message, debugMessage)
     debugPrint(debugMessage)
 
-    if vehicle and vehicle ~= 0 and DoesEntityExist(vehicle) then
-        debugPrint(('Deleting failed postal entity: %s'):format(vehicle))
-        DeleteEntity(vehicle)
-    end
+    DeletePostalVehicle(vehicle, 0, 'spawn_failure')
 
-    clearRoute(playerId)
+    clearRoute(playerId, 'spawn_failure')
     TriggerClientEvent('acg_postal:client:routeDenied', playerId, message)
 end
 
@@ -165,7 +164,7 @@ RegisterNetEvent('acg_postal:server:requestRoute', function()
 
     if type(CreateVehicle) ~= 'function' then
         debugPrint('ERROR: Server CreateVehicle native is unavailable in this artifact')
-        clearRoute(src)
+        clearRoute(src, 'create_vehicle_native_unavailable')
         TriggerClientEvent('acg_postal:client:routeDenied', src, 'This server artifact does not expose the server CreateVehicle native.')
         return
     end
@@ -190,7 +189,7 @@ RegisterNetEvent('acg_postal:server:requestRoute', function()
     end
 
     if vehicle == 0 or not DoesEntityExist(vehicle) then
-        clearRoute(src)
+        clearRoute(src, 'create_vehicle_failed')
         TriggerClientEvent('acg_postal:client:routeDenied', src, 'The postal vehicle could not be created by the server.')
         return
     end
@@ -270,8 +269,48 @@ RegisterNetEvent('acg_postal:server:requestRoute', function()
     TriggerClientEvent('acg_postal:client:routeVehicleCreated', src, vehicleNetId, plate)
 end)
 
-RegisterNetEvent('acg_postal:server:cancelRoute', function()
-    deleteRouteVehicle(source, 'route cancelled by client')
+RegisterNetEvent('acg_postal:server:cancelRoute', function(clientReason)
+    local allowedReasons = {
+        invalid_vehicle_network_id = true,
+        vehicle_resolution_failed = true,
+        plate_replication_entity_lost = true,
+        route_generation_failed = true
+    }
+    local reason = allowedReasons[clientReason] and clientReason or 'client_requested_route_cancel'
+    deleteRouteVehicle(source, reason)
+end)
+
+RegisterNetEvent('acg_postal:server:checkRouteVehicle', function()
+    local src = source
+    local route = ActiveRoutes[src]
+
+    if not route then
+        TriggerClientEvent(
+            'acg_postal:client:routeCancelled',
+            src,
+            'server_route_missing',
+            'Your postal route is no longer active.'
+        )
+        return
+    end
+
+    local vehicleExists = route.vehicle
+        and route.vehicle ~= 0
+        and DoesEntityExist(route.vehicle)
+        and GetEntityHealth(route.vehicle) > 0
+
+    if vehicleExists then
+        TriggerClientEvent('acg_postal:client:routeVehicleExists', src, route.vehicleNetId)
+        return
+    end
+
+    deleteRouteVehicle(src, 'server_confirmed_vehicle_lost')
+    TriggerClientEvent(
+        'acg_postal:client:routeCancelled',
+        src,
+        'server_confirmed_vehicle_lost',
+        'Your postal vehicle has been lost. Return to the depot to start a new route.'
+    )
 end)
 
 RegisterNetEvent('acg_postal:server:completeDelivery', function(stopNumber)
@@ -344,12 +383,12 @@ RegisterNetEvent('acg_postal:server:returnVehicle', function(vehicleNetId)
     end
 
     debugPrint(('Vehicle returned by player %s (network ID %s)'):format(src, vehicleNetId))
-    deleteRouteVehicle(src, 'player intentionally returned postal vehicle')
+    deleteRouteVehicle(src, 'vehicle_returned')
     TriggerClientEvent('acg_postal:client:returnApproved', src, vehicleNetId)
 end)
 
 AddEventHandler('playerDropped', function()
-    deleteRouteVehicle(source, 'player disconnected')
+    deleteRouteVehicle(source, 'player_dropped')
 end)
 
 AddEventHandler('onResourceStop', function(resourceName)
@@ -372,6 +411,6 @@ AddEventHandler('onResourceStop', function(resourceName)
     end
 
     for _, playerId in ipairs(playerIds) do
-        deleteRouteVehicle(playerId, 'acg_postal resource stopped')
+        deleteRouteVehicle(playerId, 'resource_stopping')
     end
 end)

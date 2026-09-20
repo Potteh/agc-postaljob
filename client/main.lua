@@ -16,6 +16,8 @@ local routeBlip = nil
 local deliveriesComplete = false
 local deliveryRequestPending = false
 local vehicleLostNotified = false
+local vehicleMissingSince = nil
+local vehicleExistenceCheckPending = false
 
 local carryAnimDict = 'anim@heists@box_carry@'
 local carryAnimName = 'idle'
@@ -299,7 +301,18 @@ local function takePackage()
     debugPrint('Package taken from vehicle')
 end
 
-local function clearRouteState()
+local function ClearRouteState(reason)
+    if not reason then
+        error('ClearRouteState requires a reason')
+    end
+
+    debugPrint(('CLEAR ROUTE STATE\nreason=%s\nonDuty=%s\nvehicle=%s\nnetId=%s'):format(
+        tostring(reason),
+        tostring(onDuty),
+        tostring(routeVehicle),
+        tostring(routeVehicleNetId)
+    ))
+
     cleanupPackage()
     removeRouteBlip()
     onDuty = false
@@ -313,7 +326,8 @@ local function clearRouteState()
     deliveriesComplete = false
     deliveryRequestPending = false
     vehicleLostNotified = false
-    debugPrint('Route state cleared')
+    vehicleMissingSince = nil
+    vehicleExistenceCheckPending = false
 end
 
 local function startVehicleDiagnostic(vehicle, networkId)
@@ -327,6 +341,24 @@ local function startVehicleDiagnostic(vehicle, networkId)
             tostring(networkId)
         ))
     end)
+end
+
+local function ResolveRouteVehicle()
+    if routeVehicle and routeVehicle ~= 0 and DoesEntityExist(routeVehicle) then
+        return routeVehicle
+    end
+
+    if routeVehicleNetId and routeVehicleNetId > 0
+        and NetworkDoesEntityExistWithNetworkId(routeVehicleNetId) then
+        local vehicle = NetToVeh(routeVehicleNetId)
+
+        if vehicle ~= 0 and DoesEntityExist(vehicle) then
+            routeVehicle = vehicle
+            return vehicle
+        end
+    end
+
+    return nil
 end
 
 local function requestRoute()
@@ -360,12 +392,7 @@ local function requestVehicleReturn()
         return
     end
 
-    local vehicle = routeVehicle
-
-    if (not vehicle or not DoesEntityExist(vehicle)) and NetworkDoesEntityExistWithNetworkId(routeVehicleNetId) then
-        vehicle = NetworkGetEntityFromNetworkId(routeVehicleNetId)
-        routeVehicle = vehicle
-    end
+    local vehicle = ResolveRouteVehicle()
 
     if not vehicle or not DoesEntityExist(vehicle) then
         QBCore.Functions.Notify('Your postal vehicle could not be found.', 'error')
@@ -390,8 +417,8 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
     debugPrint(('Resolving server vehicle network ID: %s'):format(vehicleNetId))
 
     if type(vehicleNetId) ~= 'number' or vehicleNetId <= 0 then
-        TriggerServerEvent('acg_postal:server:cancelRoute')
-        clearRouteState()
+        TriggerServerEvent('acg_postal:server:cancelRoute', 'invalid_vehicle_network_id')
+        ClearRouteState('invalid_vehicle_network_id')
         QBCore.Functions.Notify('The server returned an invalid postal vehicle.', 'error')
         return
     end
@@ -413,8 +440,8 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
 
     if vehicle == 0 or not DoesEntityExist(vehicle) then
         debugPrint(('Failed to resolve server vehicle netId=%s'):format(vehicleNetId))
-        TriggerServerEvent('acg_postal:server:cancelRoute')
-        clearRouteState()
+        TriggerServerEvent('acg_postal:server:cancelRoute', 'vehicle_resolution_failed')
+        ClearRouteState('vehicle_resolution_failed')
         QBCore.Functions.Notify('The postal vehicle could not be loaded from the server.', 'error')
         return
     end
@@ -453,8 +480,8 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
 
     if not DoesEntityExist(vehicle) then
         debugPrint(('Postal vehicle disappeared while waiting for plate replication netId=%s'):format(vehicleNetId))
-        TriggerServerEvent('acg_postal:server:cancelRoute')
-        clearRouteState()
+        TriggerServerEvent('acg_postal:server:cancelRoute', 'plate_replication_entity_lost')
+        ClearRouteState('plate_replication_entity_lost')
         QBCore.Functions.Notify('The postal vehicle disappeared before initialization.', 'error')
         return
     end
@@ -503,8 +530,8 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
     startVehicleDiagnostic(vehicle, vehicleNetId)
 
     if not generateRouteStops() then
-        TriggerServerEvent('acg_postal:server:cancelRoute')
-        clearRouteState()
+        TriggerServerEvent('acg_postal:server:cancelRoute', 'route_generation_failed')
+        ClearRouteState('route_generation_failed')
         QBCore.Functions.Notify('No postal delivery locations are configured.', 'error')
         return
     end
@@ -533,7 +560,7 @@ RegisterNetEvent('acg_postal:client:returnApproved', function(vehicleNetId)
     end
 
     debugPrint('Vehicle returned')
-    clearRouteState()
+    ClearRouteState('vehicle_returned')
     QBCore.Functions.Notify('Postal vehicle returned.', 'success')
 end)
 
@@ -570,6 +597,41 @@ end)
 RegisterNetEvent('acg_postal:client:deliveryRejected', function(message)
     deliveryRequestPending = false
     QBCore.Functions.Notify(message or 'The package delivery could not be confirmed.', 'error')
+end)
+
+RegisterNetEvent('acg_postal:client:routeVehicleExists', function(vehicleNetId)
+    if not onDuty or vehicleNetId ~= routeVehicleNetId then
+        return
+    end
+
+    vehicleExistenceCheckPending = false
+
+    local vehicle = ResolveRouteVehicle()
+
+    if vehicle then
+        debugPrint(('Route vehicle re-resolved successfully entity=%s netId=%s'):format(
+            vehicle,
+            routeVehicleNetId
+        ))
+        vehicleMissingSince = nil
+        return
+    end
+
+    vehicleMissingSince = GetGameTimer()
+    debugPrint(('Server confirms route vehicle still exists; continuing re-resolution netId=%s'):format(vehicleNetId))
+end)
+
+RegisterNetEvent('acg_postal:client:routeCancelled', function(reason, message)
+    if not onDuty and not routeRequestPending then
+        return
+    end
+
+    if not vehicleLostNotified then
+        vehicleLostNotified = true
+        QBCore.Functions.Notify(message or 'Your postal route was cancelled.', 'error')
+    end
+
+    ClearRouteState(reason or 'server_cancelled_route')
 end)
 
 CreateThread(function()
@@ -612,16 +674,30 @@ CreateThread(function()
         local waitTime = 1000
 
         if onDuty and not deliveriesComplete and routeStops[currentStop] then
-            local vehicle = routeVehicle
+            local wasMissing = vehicleMissingSince ~= nil
+            local vehicle = ResolveRouteVehicle()
 
-            if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) or IsEntityDead(vehicle) then
-                if not vehicleLostNotified then
-                    vehicleLostNotified = true
-                    QBCore.Functions.Notify('Your postal vehicle has been lost. Return to the depot to start a new route.', 'error')
-                    TriggerServerEvent('acg_postal:server:cancelRoute')
-                    clearRouteState()
+            if not vehicle or IsEntityDead(vehicle) then
+                local now = GetGameTimer()
+
+                if not vehicleMissingSince then
+                    vehicleMissingSince = now
+                    debugPrint('Route vehicle temporarily unavailable - attempting network re-resolution')
+                elseif now - vehicleMissingSince >= 10000 and not vehicleExistenceCheckPending then
+                    vehicleExistenceCheckPending = true
+                    debugPrint(('Requesting server route vehicle validation netId=%s'):format(routeVehicleNetId))
+                    TriggerServerEvent('acg_postal:server:checkRouteVehicle')
                 end
             else
+                if wasMissing then
+                    debugPrint(('Route vehicle re-resolved successfully entity=%s netId=%s'):format(
+                        vehicle,
+                        routeVehicleNetId
+                    ))
+                end
+
+                vehicleMissingSince = nil
+                vehicleExistenceCheckPending = false
                 local ped = PlayerPedId()
                 local playerCoords = GetEntityCoords(ped)
                 local stop = routeStops[currentStop]
@@ -714,5 +790,5 @@ AddEventHandler('onResourceStop', function(resourceName)
         return
     end
 
-    clearRouteState()
+    ClearRouteState('resource_stopping')
 end)
