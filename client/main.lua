@@ -38,16 +38,61 @@ local function isVehicleSpawnClear()
     return not IsAnyVehicleNearPoint(spawn.x, spawn.y, spawn.z, Config.VehicleSpawnClearance)
 end
 
-local function setVehicleFuel(vehicle)
-    -- No external fuel resource was available in the workspace. Leave fuel
-    -- unchanged until the server's actual fuel system can be integrated here.
-    debugPrint(('No fuel integration configured for entity %s'):format(vehicle))
+local function SetPostalVehicleFuel(vehicle)
+    if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then
+        debugPrint('ERROR: Postal vehicle fuel initialization skipped because the entity does not exist')
+        return false
+    end
+
+    if GetResourceState('qb-fuel') ~= 'started' then
+        debugPrint('ERROR: Postal vehicle fuel initialization failed because qb-fuel is not started')
+        return false
+    end
+
+    local success, errorMessage = pcall(function()
+        exports['qb-fuel']:SetFuel(vehicle, 100.0)
+    end)
+
+    if not success then
+        debugPrint(('ERROR: Postal vehicle fuel initialization failed: %s'):format(errorMessage))
+        return false
+    end
+
+    debugPrint('Postal vehicle fuel initialized to 100%')
+    return true
 end
 
-local function giveVehicleKeys(vehicle, plate)
-    -- No vehicle-key resource was available in the workspace. This helper is
-    -- intentionally isolated so the correct resource export/event can be added.
-    debugPrint(('No vehicle-key integration configured for %s (%s)'):format(vehicle, plate))
+local function GivePostalVehicleKeys(vehicle)
+    if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then
+        debugPrint('ERROR: Postal vehicle key assignment skipped because the entity does not exist')
+        return false
+    end
+
+    if GetResourceState('qb-vehiclekeys') ~= 'started' then
+        debugPrint('ERROR: Postal vehicle key assignment failed because qb-vehiclekeys is not started')
+        return false
+    end
+
+    local success, plateOrError = pcall(function()
+        local plate = tostring(QBCore.Functions.GetPlate(vehicle) or '')
+            :gsub('^%s+', '')
+            :gsub('%s+$', '')
+
+        if plate == '' then
+            error('the vehicle plate is empty')
+        end
+
+        TriggerEvent('vehiclekeys:client:SetOwner', plate)
+        return plate
+    end)
+
+    if not success then
+        debugPrint(('ERROR: Postal vehicle key assignment failed: %s'):format(plateOrError))
+        return false
+    end
+
+    debugPrint(('Postal vehicle keys assigned: %s'):format(plateOrError))
+    return true
 end
 
 local function clearRouteState()
@@ -162,7 +207,13 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
     onDuty = true
     routeRequestPending = false
 
-    debugPrint('Diagnostic mode: leaving the server-created vehicle untouched')
+    SetVehicleEngineOn(vehicle, true, true, false)
+    SetVehicleNeedsToBeHotwired(vehicle, false)
+    SetVehicleHasBeenOwnedByPlayer(vehicle, true)
+    SetVehRadioStation(vehicle, 'OFF')
+    SetPostalVehicleFuel(vehicle)
+    GivePostalVehicleKeys(vehicle)
+    TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, -1)
     startVehicleDiagnostic(vehicle, vehicleNetId)
 
     debugPrint(('Server postal vehicle resolved: entity=%s netId=%s plate=%s'):format(vehicle, vehicleNetId, plate))

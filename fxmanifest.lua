@@ -13,3 +13,5 @@ client_script 'client/main.lua'
 server_script 'server/main.lua'
 
 dependency 'qb-core'
+dependency 'qb-vehiclekeys'
+dependency 'qb-fuel'
