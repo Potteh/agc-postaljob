@@ -2,6 +2,12 @@ Config = {}
 
 Config.Debug = true
 
+Config.DiagnosticVehicleInit = true
+Config.TestFuel = false
+Config.TestKeys = false
+Config.TestVehicleNatives = false
+Config.TestWarp = false
+
 Config.RequireJob = false
 Config.JobName = 'postal'
 

@@ -38,8 +38,33 @@ local function isVehicleSpawnClear()
     return not IsAnyVehicleNearPoint(spawn.x, spawn.y, spawn.z, Config.VehicleSpawnClearance)
 end
 
+local function NormalizePlate(plate)
+    return (plate or ''):gsub('^%s*(.-)%s*$', '%1'):upper()
+end
+
+local function entityExists(vehicle)
+    return vehicle ~= nil and vehicle ~= 0 and DoesEntityExist(vehicle)
+end
+
+local function runInitializationOperation(label, vehicle, operation)
+    debugPrint(('BEFORE %s entity exists=%s'):format(label, tostring(entityExists(vehicle))))
+
+    local success, errorMessage = pcall(operation)
+
+    if not success then
+        debugPrint(('ERROR: %s failed: %s'):format(label, errorMessage))
+    end
+
+    debugPrint(('AFTER %s entity exists=%s'):format(label, tostring(entityExists(vehicle))))
+
+    CreateThread(function()
+        Wait(1000)
+        debugPrint(('1000ms AFTER %s entity exists=%s'):format(label, tostring(entityExists(vehicle))))
+    end)
+end
+
 local function SetPostalVehicleFuel(vehicle)
-    if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then
+    if not entityExists(vehicle) then
         debugPrint('ERROR: Postal vehicle fuel initialization skipped because the entity does not exist')
         return false
     end
@@ -62,8 +87,8 @@ local function SetPostalVehicleFuel(vehicle)
     return true
 end
 
-local function GivePostalVehicleKeys(vehicle)
-    if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then
+local function GivePostalVehicleKeys(vehicle, expectedPlate)
+    if not entityExists(vehicle) then
         debugPrint('ERROR: Postal vehicle key assignment skipped because the entity does not exist')
         return false
     end
@@ -73,25 +98,27 @@ local function GivePostalVehicleKeys(vehicle)
         return false
     end
 
-    local success, plateOrError = pcall(function()
-        local plate = tostring(QBCore.Functions.GetPlate(vehicle) or '')
-            :gsub('^%s+', '')
-            :gsub('%s+$', '')
+    local actualPlate = NormalizePlate(GetVehicleNumberPlateText(vehicle))
+    expectedPlate = NormalizePlate(expectedPlate)
 
-        if plate == '' then
-            error('the vehicle plate is empty')
-        end
-
-        TriggerEvent('vehiclekeys:client:SetOwner', plate)
-        return plate
-    end)
-
-    if not success then
-        debugPrint(('ERROR: Postal vehicle key assignment failed: %s'):format(plateOrError))
+    if expectedPlate == '' or actualPlate ~= expectedPlate then
+        debugPrint(('ERROR: Postal vehicle key assignment skipped due to plate mismatch expected=%s actual=%s'):format(
+            expectedPlate,
+            actualPlate
+        ))
         return false
     end
 
-    debugPrint(('Postal vehicle keys assigned: %s'):format(plateOrError))
+    local success, errorMessage = pcall(function()
+        TriggerEvent('vehiclekeys:client:SetOwner', expectedPlate)
+    end)
+
+    if not success then
+        debugPrint(('ERROR: Postal vehicle key assignment failed: %s'):format(errorMessage))
+        return false
+    end
+
+    debugPrint(('Postal vehicle keys assigned: %s'):format(expectedPlate))
     return true
 end
 
@@ -202,18 +229,87 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
         return
     end
 
+    local expectedPlate = NormalizePlate(plate)
+    local actualPlate = NormalizePlate(GetVehicleNumberPlateText(vehicle))
+    debugPrint(('Expected server plate: %s'):format(expectedPlate))
+    debugPrint(('Initial client plate: %s'):format(actualPlate))
+
+    if actualPlate ~= expectedPlate then
+        debugPrint('Waiting for postal plate replication...')
+    end
+
+    local plateTimeout = GetGameTimer() + 5000
+
+    while actualPlate ~= expectedPlate and GetGameTimer() < plateTimeout do
+        if not DoesEntityExist(vehicle) then
+            break
+        end
+
+        Wait(100)
+
+        if DoesEntityExist(vehicle) then
+            actualPlate = NormalizePlate(GetVehicleNumberPlateText(vehicle))
+        end
+    end
+
+    debugPrint(('Final client plate: %s'):format(actualPlate))
+
+    if actualPlate ~= expectedPlate then
+        debugPrint(('ERROR: Postal plate did not replicate before timeout expected=%s actual=%s'):format(
+            expectedPlate,
+            actualPlate
+        ))
+    end
+
+    if not DoesEntityExist(vehicle) then
+        debugPrint(('Postal vehicle disappeared while waiting for plate replication netId=%s'):format(vehicleNetId))
+        TriggerServerEvent('acg_postal:server:cancelRoute')
+        clearRouteState()
+        QBCore.Functions.Notify('The postal vehicle disappeared before initialization.', 'error')
+        return
+    end
+
     routeVehicle = vehicle
     routeVehicleNetId = vehicleNetId
     onDuty = true
     routeRequestPending = false
 
-    SetVehicleEngineOn(vehicle, true, true, false)
-    SetVehicleNeedsToBeHotwired(vehicle, false)
-    SetVehicleHasBeenOwnedByPlayer(vehicle, true)
-    SetVehRadioStation(vehicle, 'OFF')
-    SetPostalVehicleFuel(vehicle)
-    GivePostalVehicleKeys(vehicle)
-    TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, -1)
+    local testFuel = not Config.DiagnosticVehicleInit or Config.TestFuel
+    local testKeys = not Config.DiagnosticVehicleInit or Config.TestKeys
+    local testVehicleNatives = not Config.DiagnosticVehicleInit or Config.TestVehicleNatives
+    local testWarp = not Config.DiagnosticVehicleInit or Config.TestWarp
+
+    if testVehicleNatives then
+        runInitializationOperation('vehicle natives', vehicle, function()
+            SetVehicleEngineOn(vehicle, true, true, false)
+            SetVehicleNeedsToBeHotwired(vehicle, false)
+            SetVehicleHasBeenOwnedByPlayer(vehicle, true)
+            SetVehRadioStation(vehicle, 'OFF')
+        end)
+    end
+
+    if testFuel then
+        runInitializationOperation('qb-fuel', vehicle, function()
+            SetPostalVehicleFuel(vehicle)
+        end)
+    end
+
+    if testKeys then
+        runInitializationOperation('qb-vehiclekeys', vehicle, function()
+            GivePostalVehicleKeys(vehicle, expectedPlate)
+        end)
+    end
+
+    if testWarp then
+        runInitializationOperation('player warp', vehicle, function()
+            TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, -1)
+        end)
+    end
+
+    if Config.DiagnosticVehicleInit and not testFuel and not testKeys and not testVehicleNatives and not testWarp then
+        debugPrint('Diagnostic mode: leaving the server-created vehicle untouched')
+    end
+
     startVehicleDiagnostic(vehicle, vehicleNetId)
 
     debugPrint(('Server postal vehicle resolved: entity=%s netId=%s plate=%s'):format(vehicle, vehicleNetId, plate))
