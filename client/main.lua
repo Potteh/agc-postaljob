@@ -326,20 +326,87 @@ local function ClearRouteState(reason)
     vehicleExistenceCheckPending = false
 end
 
-local function logRouteVehicleStatus(networkId)
-    local vehicle = ResolveRouteVehicle()
+local function getNetworkOwner(vehicle)
+    if not entityExists(vehicle) or type(NetworkGetEntityOwner) ~= 'function' then
+        return 'unknown'
+    end
 
-    debugPrint(('Route vehicle status: %s entity=%s netId=%s'):format(
-        vehicle and 'RESOLVED' or 'UNRESOLVED',
-        tostring(vehicle or 0),
-        tostring(networkId)
-    ))
+    local success, owner = pcall(NetworkGetEntityOwner, vehicle)
+    return success and tostring(owner) or 'unknown'
 end
 
-local function startVehicleDiagnostic(networkId)
+local function logRouteVehicleStatus(networkId)
+    local vehicle = ResolveRouteVehicle()
+    local ped = PlayerPedId()
+    local playerVehicle = GetVehiclePedIsIn(ped, false)
+    local playerInVehicle = vehicle ~= nil and playerVehicle == vehicle
+
+    debugPrint(('VEHICLE NET STATUS: netId=%s entity=%s exists=%s control=%s owner=%s playerInVehicle=%s pedInAnyVehicle=%s pedVehicle=%s'):format(
+        tostring(networkId),
+        tostring(vehicle or 0),
+        tostring(vehicle ~= nil),
+        tostring(vehicle ~= nil and NetworkHasControlOfEntity(vehicle) or false),
+        getNetworkOwner(vehicle),
+        tostring(playerInVehicle),
+        tostring(IsPedInAnyVehicle(ped, false)),
+        tostring(playerVehicle)
+    ))
+
+    return vehicle, playerInVehicle
+end
+
+local function startVehicleNetworkDiagnostics(networkId, playerEnteredVehicle)
+    if not Config.Debug then
+        return
+    end
+
     CreateThread(function()
-        Wait(5000)
-        logRouteVehicleStatus(networkId)
+        local wasResolved = true
+        local warnedAfterEntry = false
+        local lastOwner = nil
+
+        for _ = 1, 15 do
+            Wait(2000)
+
+            if not onDuty or routeVehicleNetId ~= networkId then
+                break
+            end
+
+            local vehicle, playerInVehicle = logRouteVehicleStatus(networkId)
+            local owner = getNetworkOwner(vehicle)
+
+            if lastOwner ~= nil and owner ~= lastOwner then
+                debugPrint(('Postal vehicle network owner changed: %s -> %s netId=%s'):format(
+                    lastOwner,
+                    owner,
+                    networkId
+                ))
+            end
+
+            lastOwner = owner
+
+            if not vehicle and wasResolved then
+                debugPrint('Route vehicle temporarily unavailable - attempting network re-resolution')
+            elseif vehicle and not wasResolved then
+                debugPrint(('Route vehicle re-resolved successfully entity=%s netId=%s'):format(
+                    vehicle,
+                    networkId
+                ))
+            end
+
+            if not vehicle and wasResolved and playerEnteredVehicle and not warnedAfterEntry then
+                warnedAfterEntry = true
+                debugPrint('WARNING: postal network entity became unresolved after player entered it')
+            elseif vehicle then
+                warnedAfterEntry = false
+            end
+
+            if playerInVehicle then
+                playerEnteredVehicle = true
+            end
+
+            wasResolved = vehicle ~= nil
+        end
     end)
 end
 
@@ -359,6 +426,28 @@ ResolveRouteVehicle = function()
     end
 
     return nil
+end
+
+local function RequestControlOfPostalVehicle(vehicle)
+    if not entityExists(vehicle) then
+        debugPrint('Postal vehicle network control: false')
+        return false
+    end
+
+    debugPrint('Requesting network control of postal vehicle')
+    local timeout = GetGameTimer() + 5000
+    NetworkRequestControlOfEntity(vehicle)
+
+    while DoesEntityExist(vehicle)
+        and not NetworkHasControlOfEntity(vehicle)
+        and GetGameTimer() < timeout do
+        NetworkRequestControlOfEntity(vehicle)
+        Wait(50)
+    end
+
+    local hasControl = DoesEntityExist(vehicle) and NetworkHasControlOfEntity(vehicle)
+    debugPrint(('Postal vehicle network control: %s'):format(tostring(hasControl)))
+    return hasControl
 end
 
 local function requestRoute()
@@ -489,10 +578,23 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
     onDuty = true
     routeRequestPending = false
 
+    RequestControlOfPostalVehicle(vehicle)
+
+    local migrationConfigured, migrationError = pcall(function()
+        SetNetworkIdCanMigrate(routeVehicleNetId, true)
+    end)
+
+    if not migrationConfigured then
+        debugPrint(('ERROR: Could not enable postal vehicle network migration: %s'):format(migrationError))
+    end
+
+    vehicle = ResolveRouteVehicle() or vehicle
+
     local testFuel = not Config.DiagnosticVehicleInit or Config.TestFuel
     local testKeys = not Config.DiagnosticVehicleInit or Config.TestKeys
     local testVehicleNatives = not Config.DiagnosticVehicleInit or Config.TestVehicleNatives
     local testWarp = not Config.DiagnosticVehicleInit or Config.TestWarp
+    local playerEnteredVehicle = false
 
     if testVehicleNatives then
         runInitializationOperation('vehicle natives', vehicle, function()
@@ -517,15 +619,25 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
 
     if testWarp then
         runInitializationOperation('player warp', vehicle, function()
-            TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, -1)
+            if entityExists(vehicle) then
+                TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, -1)
+            end
         end)
+
+        Wait(250)
+        local resolvedVehicle = ResolveRouteVehicle()
+        local playerVehicle = GetVehiclePedIsIn(PlayerPedId(), false)
+        playerEnteredVehicle = resolvedVehicle ~= nil and playerVehicle == resolvedVehicle
+        debugPrint(('Player vehicle after warp: %s'):format(playerVehicle))
+        debugPrint(('Postal vehicle entity: %s'):format(resolvedVehicle or 0))
+        debugPrint(('Player successfully entered postal vehicle: %s'):format(tostring(playerEnteredVehicle)))
     end
 
     if Config.DiagnosticVehicleInit and not testFuel and not testKeys and not testVehicleNatives and not testWarp then
         debugPrint('Diagnostic mode: leaving the server-created vehicle untouched')
     end
 
-    startVehicleDiagnostic(vehicleNetId)
+    startVehicleNetworkDiagnostics(vehicleNetId, playerEnteredVehicle)
 
     if not generateRouteStops() then
         TriggerServerEvent('acg_postal:server:cancelRoute', 'route_generation_failed')
@@ -678,18 +790,20 @@ CreateThread(function()
             local vehicle = ResolveRouteVehicle()
 
             if not vehicle or IsEntityDead(vehicle) then
-                local now = GetGameTimer()
+                if Config.EnableVehicleLossMonitor then
+                    local now = GetGameTimer()
 
-                if not vehicleMissingSince then
-                    vehicleMissingSince = now
-                    debugPrint('Route vehicle temporarily unavailable - attempting network re-resolution')
-                elseif now - vehicleMissingSince >= 10000 and not vehicleExistenceCheckPending then
-                    vehicleExistenceCheckPending = true
-                    debugPrint(('Requesting server route vehicle validation netId=%s'):format(routeVehicleNetId))
-                    TriggerServerEvent('acg_postal:server:checkRouteVehicle')
+                    if not vehicleMissingSince then
+                        vehicleMissingSince = now
+                        debugPrint('Route vehicle temporarily unavailable - attempting network re-resolution')
+                    elseif now - vehicleMissingSince >= 10000 and not vehicleExistenceCheckPending then
+                        vehicleExistenceCheckPending = true
+                        debugPrint(('Requesting server route vehicle validation netId=%s'):format(routeVehicleNetId))
+                        TriggerServerEvent('acg_postal:server:checkRouteVehicle')
+                    end
                 end
             else
-                if wasMissing then
+                if Config.EnableVehicleLossMonitor and wasMissing then
                     debugPrint(('Route vehicle re-resolved successfully entity=%s netId=%s'):format(
                         vehicle,
                         routeVehicleNetId
