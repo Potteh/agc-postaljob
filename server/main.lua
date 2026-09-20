@@ -252,11 +252,15 @@ RegisterNetEvent('acg_postal:server:requestRoute', function()
 
     local plate = generatePlate()
     SetVehicleNumberPlateText(vehicle, plate)
+    local totalStops = math.max(1, math.floor(tonumber(Config.DeliveriesPerRoute) or 1))
 
     ActiveRoutes[src] = {
         vehicle = vehicle,
         vehicleNetId = vehicleNetId,
-        plate = plate
+        plate = plate,
+        currentStop = 1,
+        totalStops = totalStops,
+        deliveriesComplete = false
     }
     PendingRoutes[src] = nil
 
@@ -270,6 +274,45 @@ RegisterNetEvent('acg_postal:server:cancelRoute', function()
     deleteRouteVehicle(source, 'route cancelled by client')
 end)
 
+RegisterNetEvent('acg_postal:server:completeDelivery', function(stopNumber)
+    local src = source
+    local route = ActiveRoutes[src]
+
+    if not route then
+        TriggerClientEvent('acg_postal:client:deliveryRejected', src, 'You do not have an active postal route.')
+        return
+    end
+
+    if route.deliveriesComplete or route.currentStop > route.totalStops then
+        TriggerClientEvent('acg_postal:client:deliveryRejected', src, 'All postal deliveries are already complete.')
+        return
+    end
+
+    if type(stopNumber) ~= 'number' or stopNumber % 1 ~= 0 or stopNumber ~= route.currentStop then
+        TriggerClientEvent('acg_postal:client:deliveryRejected', src, 'The postal delivery is out of sequence.')
+        return
+    end
+
+    local completedStop = route.currentStop
+
+    if completedStop >= route.totalStops then
+        route.deliveriesComplete = true
+        route.currentStop = route.totalStops + 1
+    else
+        route.currentStop = route.currentStop + 1
+    end
+
+    debugPrint(('Package delivered by player %s'):format(src))
+    debugPrint(('Server accepted delivery %s/%s'):format(completedStop, route.totalStops))
+    TriggerClientEvent(
+        'acg_postal:client:deliveryAccepted',
+        src,
+        completedStop,
+        route.totalStops,
+        route.deliveriesComplete
+    )
+end)
+
 RegisterNetEvent('acg_postal:server:returnVehicle', function(vehicleNetId)
     local src = source
     local route = ActiveRoutes[src]
@@ -281,6 +324,11 @@ RegisterNetEvent('acg_postal:server:returnVehicle', function(vehicleNetId)
 
     if type(vehicleNetId) ~= 'number' or vehicleNetId ~= route.vehicleNetId then
         TriggerClientEvent('acg_postal:client:returnDenied', src, 'This is not your assigned postal vehicle.')
+        return
+    end
+
+    if not route.deliveriesComplete then
+        TriggerClientEvent('acg_postal:client:returnDenied', src, 'Complete all postal deliveries before returning the vehicle.')
         return
     end
 
