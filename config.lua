@@ -2,13 +2,6 @@ Config = {}
 
 Config.Debug = true
 
-Config.DiagnosticVehicleInit = false
-Config.TestFuel = false
-Config.TestKeys = false
-Config.TestVehicleNatives = false
-Config.TestWarp = false
-Config.EnableVehicleLossMonitor = false
-
 Config.RequireJob = false
 Config.JobName = 'postal'
 

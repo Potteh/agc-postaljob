@@ -1,7 +1,6 @@
 local QBCore = exports['qb-core']:GetCoreObject()
 
 local ActiveRoutes = {}
-local PendingRoutes = {}
 
 local function debugPrint(message)
     if Config.Debug then
@@ -9,14 +8,13 @@ local function debugPrint(message)
     end
 end
 
-local function clearRoute(playerId, reason)
-    if not reason then
-        error('clearRoute requires a reason')
-    end
+local function normalizePlate(plate)
+    return tostring(plate or ''):gsub('^%s*(.-)%s*$', '%1'):upper()
+end
 
-    if ActiveRoutes[playerId] or PendingRoutes[playerId] then
+local function clearRoute(playerId, reason)
+    if ActiveRoutes[playerId] then
         ActiveRoutes[playerId] = nil
-        PendingRoutes[playerId] = nil
         debugPrint(('Server route state cleared player=%s reason=%s'):format(playerId, reason))
     end
 end
@@ -30,129 +28,20 @@ local function hasRequiredJob(player)
     return job and job.name == Config.JobName
 end
 
-local function generatePlate()
-    local prefix = tostring(Config.VehiclePlatePrefix or 'POSTAL'):upper():gsub('%s+', ''):sub(1, 8)
-    local suffixLength = 8 - #prefix
+local function isValidPostalPlate(plate)
+    local prefix = normalizePlate(Config.VehiclePlatePrefix or 'POSTAL'):gsub('%s+', ''):sub(1, 6)
+    local suffix = plate:sub(#prefix + 1)
 
-    if suffixLength == 0 then
-        return prefix
-    end
-
-    local maximum = (10 ^ suffixLength) - 1
-    return prefix .. string.format('%0' .. suffixLength .. 'd', math.random(0, maximum))
-end
-
-local function isVehicleSpawnClear()
-    local spawnCoords = vector3(Config.VehicleSpawn.x, Config.VehicleSpawn.y, Config.VehicleSpawn.z)
-
-    for _, vehicle in ipairs(GetAllVehicles()) do
-        if DoesEntityExist(vehicle) and #(GetEntityCoords(vehicle) - spawnCoords) <= Config.VehicleSpawnClearance then
-            return false
-        end
-    end
-
-    return true
-end
-
-
-local function ResolvePostalVehicleEntity(vehicleNetId)
-    if type(vehicleNetId) ~= 'number' or vehicleNetId <= 0 then
-        return 0
-    end
-
-    local vehicle = NetworkGetEntityFromNetworkId(vehicleNetId)
-
-    if vehicle == 0 or not DoesEntityExist(vehicle) then
-        return 0
-    end
-
-    return vehicle
-end
-
-
-local function DeletePostalVehicle(vehicleNetId, fallbackVehicle, reason)
-    local vehicle = ResolvePostalVehicleEntity(vehicleNetId)
-
-    if vehicle == 0 and fallbackVehicle and fallbackVehicle ~= 0 and DoesEntityExist(fallbackVehicle) then
-        vehicle = fallbackVehicle
-    end
-
-    local exists = vehicle ~= 0 and DoesEntityExist(vehicle)
-
-    debugPrint(('SERVER DELETE POSTAL VEHICLE\nreason=%s\nentity=%s\nnetId=%s\nexists=%s'):format(
-        tostring(reason),
-        tostring(vehicle),
-        tostring(vehicleNetId),
-        tostring(exists)
-    ))
-
-    if exists then
-        DeleteEntity(vehicle)
-    end
-end
-
-
-local function deleteRouteVehicle(playerId, reason)
-    local route = ActiveRoutes[playerId]
-
-    if not route then
-        local pendingRoute = PendingRoutes[playerId]
-
-        if pendingRoute and pendingRoute.vehicle and pendingRoute.vehicle ~= 0 then
-            DeletePostalVehicle(0, pendingRoute.vehicle, reason)
-        end
-
-        clearRoute(playerId, reason)
-        return
-    end
-
-    DeletePostalVehicle(route.vehicleNetId, nil, reason)
-    clearRoute(playerId, reason)
-end
-
-
-local function failVehicleCreation(playerId, vehicle, message, debugMessage)
-    debugPrint(debugMessage)
-
-    DeletePostalVehicle(0, vehicle, 'spawn_failure')
-
-    clearRoute(playerId, 'spawn_failure')
-    TriggerClientEvent('acg_postal:client:routeDenied', playerId, message)
-end
-
-
-local function startVehicleDiagnostic(playerId, vehicleNetId)
-    local checks = {
-        { delay = 1000, label = '1-second' },
-        { delay = 5000, label = '5-second' },
-        { delay = 10000, label = '10-second' },
-        { delay = 30000, label = '30-second' }
-    }
-
-    for _, check in ipairs(checks) do
-        local delay = check.delay
-        local label = check.label
-
-        SetTimeout(delay, function()
-            local vehicle = ResolvePostalVehicleEntity(vehicleNetId)
-            local exists = vehicle ~= 0
-
-            debugPrint(('%s SERVER network check: %s entity=%s netId=%s player=%s'):format(
-                label,
-                exists and 'RESOLVED' or 'UNRESOLVED',
-                vehicle,
-                vehicleNetId,
-                playerId
-            ))
-        end)
-    end
+    return plate:sub(1, #prefix) == prefix
+        and #suffix == 2
+        and tonumber(suffix) ~= nil
 end
 
 RegisterNetEvent('acg_postal:server:requestRoute', function()
     local src = source
     debugPrint(('Route requested by player %s'):format(src))
 
-    if ActiveRoutes[src] or PendingRoutes[src] then
+    if ActiveRoutes[src] then
         TriggerClientEvent('acg_postal:client:routeDenied', src, 'You already have an active postal route.')
         return
     end
@@ -168,185 +57,79 @@ RegisterNetEvent('acg_postal:server:requestRoute', function()
         return
     end
 
-    if not isVehicleSpawnClear() then
-        TriggerClientEvent('acg_postal:client:routeDenied', src, 'The postal vehicle spawn is blocked.')
-        return
-    end
-
-    PendingRoutes[src] = {
-        vehicle = 0
-    }
-
-    local spawn = Config.VehicleSpawn
-    local model = joaat(Config.VehicleModel)
-    debugPrint('Creating vehicle with CreateVehicle')
-    debugPrint(('Model name: %s'):format(Config.VehicleModel))
-    debugPrint(('Model hash: %s'):format(model))
-    debugPrint(('Spawn: %.2f %.2f %.2f %.2f'):format(spawn.x, spawn.y, spawn.z, spawn.w))
-
-    if type(CreateVehicle) ~= 'function' then
-        debugPrint('ERROR: Server CreateVehicle native is unavailable in this artifact')
-        clearRoute(src, 'create_vehicle_native_unavailable')
-        TriggerClientEvent('acg_postal:client:routeDenied', src, 'This server artifact does not expose the server CreateVehicle native.')
-        return
-    end
-
-    local vehicle = CreateVehicle(
-        model,
-        spawn.x,
-        spawn.y,
-        spawn.z,
-        spawn.w,
-        true,
-        true
-    )
-
-    debugPrint(('CreateVehicle returned entity: %s'):format(vehicle))
-    debugPrint(('DoesEntityExist immediately: %s'):format(vehicle ~= 0 and DoesEntityExist(vehicle) or false))
-
-    local entityTimeout = GetGameTimer() + 5000
-
-    while vehicle ~= 0 and not DoesEntityExist(vehicle) and GetGameTimer() < entityTimeout do
-        Wait(50)
-    end
-
-    if vehicle == 0 or not DoesEntityExist(vehicle) then
-        clearRoute(src, 'create_vehicle_failed')
-        TriggerClientEvent('acg_postal:client:routeDenied', src, 'The postal vehicle could not be created by the server.')
-        return
-    end
-
-    if not PendingRoutes[src] then
-        failVehicleCreation(
-            src,
-            vehicle,
-            'Postal vehicle creation was cancelled.',
-            'ERROR: Postal vehicle creation was cancelled before entity registration'
-        )
-        return
-    end
-
-    PendingRoutes[src].vehicle = vehicle
-
-    SetEntityOrphanMode(vehicle, 2)
-    SetEntityRoutingBucket(vehicle, GetPlayerRoutingBucket(src))
-
-    local vehicleNetId = 0
-    local networkTimeout = GetGameTimer() + 5000
-    debugPrint('Waiting for usable network ID...')
-
-    while GetGameTimer() < networkTimeout do
-        if DoesEntityExist(vehicle) then
-            vehicleNetId = NetworkGetNetworkIdFromEntity(vehicle)
-
-            if vehicleNetId and vehicleNetId > 0 and vehicleNetId < 65534 then
-                break
-            end
-        else
-            break
-        end
-
-        Wait(50)
-    end
-
-    if not vehicleNetId or vehicleNetId <= 0 or vehicleNetId >= 65534 then
-        failVehicleCreation(
-            src,
-            vehicle,
-            'The postal vehicle could not obtain a usable network ID.',
-            'ERROR: Postal vehicle failed to obtain usable network ID'
-        )
-        return
-    end
-
-    debugPrint(('Network ID: %s'):format(vehicleNetId))
-
-    if not PendingRoutes[src] or not GetPlayerName(src) then
-        failVehicleCreation(
-            src,
-            vehicle,
-            'Postal vehicle creation was cancelled.',
-            'ERROR: Postal vehicle creation was cancelled before route registration'
-        )
-        return
-    end
-
-    local plate = generatePlate()
-    SetVehicleNumberPlateText(vehicle, plate)
-    local totalStops = math.max(1, math.floor(tonumber(Config.DeliveriesPerRoute) or 1))
-
     ActiveRoutes[src] = {
-        vehicleNetId = vehicleNetId,
-        plate = plate,
+        vehicleNetId = nil,
+        plate = nil,
+        vehicleRegistered = false,
         currentStop = 1,
-        totalStops = totalStops,
+        totalStops = math.max(1, math.floor(tonumber(Config.DeliveriesPerRoute) or 1)),
         deliveriesComplete = false
     }
-    PendingRoutes[src] = nil
 
-    debugPrint(('Postal plate: %s'):format(plate))
-    debugPrint(('Sending postal vehicle to player %s'):format(src))
-    startVehicleDiagnostic(src, vehicleNetId)
-    TriggerClientEvent('acg_postal:client:routeVehicleCreated', src, vehicleNetId, plate)
+    debugPrint(('Route approved for player %s'):format(src))
+    TriggerClientEvent('acg_postal:client:routeApproved', src)
 end)
 
-RegisterNetEvent('acg_postal:server:cancelRoute', function(clientReason)
-    local allowedReasons = {
-        invalid_vehicle_network_id = true,
-        vehicle_resolution_failed = true,
-        plate_replication_entity_lost = true,
-        route_generation_failed = true
-    }
-    local reason = allowedReasons[clientReason] and clientReason or 'client_requested_route_cancel'
-    deleteRouteVehicle(source, reason)
-end)
-
-RegisterNetEvent('acg_postal:server:checkRouteVehicle', function()
+RegisterNetEvent('acg_postal:server:registerRouteVehicle', function(vehicleNetId, plate)
     local src = source
     local route = ActiveRoutes[src]
 
     if not route then
-        TriggerClientEvent(
-            'acg_postal:client:routeCancelled',
-            src,
-            'server_route_missing',
-            'Your postal route is no longer active.'
-        )
+        TriggerClientEvent('acg_postal:client:routeVehicleRegistrationFailed', src, 'The server no longer has an active postal route.')
         return
     end
 
-    local vehicle = ResolvePostalVehicleEntity(route.vehicleNetId)
-    local vehicleExists = vehicle ~= 0 and GetEntityHealth(vehicle) > 0
+    plate = normalizePlate(plate)
 
-    if vehicleExists then
-        TriggerClientEvent('acg_postal:client:routeVehicleExists', src, route.vehicleNetId)
+    if route.vehicleRegistered then
+        if route.vehicleNetId == vehicleNetId and route.plate == plate then
+            TriggerClientEvent('acg_postal:client:routeVehicleRegistered', src, route.vehicleNetId, route.plate)
+        else
+            TriggerClientEvent('acg_postal:client:routeVehicleRegistrationFailed', src, 'A different postal vehicle is already registered to this route.')
+        end
+
         return
     end
 
-    if vehicle ~= 0 then
-        deleteRouteVehicle(src, 'server_confirmed_vehicle_destroyed')
-        TriggerClientEvent(
-            'acg_postal:client:routeCancelled',
-            src,
-            'server_confirmed_vehicle_destroyed',
-            'Your postal vehicle has been destroyed. Return to the depot to start a new route.'
-        )
+    if type(vehicleNetId) ~= 'number' or vehicleNetId <= 0 or vehicleNetId % 1 ~= 0 then
+        clearRoute(src, 'invalid_vehicle_network_id')
+        TriggerClientEvent('acg_postal:client:routeVehicleRegistrationFailed', src, 'The postal vehicle has an invalid network ID.')
         return
     end
 
-    debugPrint(('Route vehicle network ID is currently unresolved; keeping route active player=%s netId=%s'):format(
-        src,
-        route.vehicleNetId
-    ))
-    TriggerClientEvent('acg_postal:client:routeVehicleExists', src, route.vehicleNetId)
+    if not isValidPostalPlate(plate) then
+        clearRoute(src, 'invalid_vehicle_plate')
+        TriggerClientEvent('acg_postal:client:routeVehicleRegistrationFailed', src, 'The postal vehicle has an invalid plate.')
+        return
+    end
+
+    route.vehicleNetId = vehicleNetId
+    route.plate = plate
+    route.vehicleRegistered = true
+
+    debugPrint(('Postal vehicle registered player=%s netId=%s plate=%s'):format(src, vehicleNetId, plate))
+    TriggerClientEvent('acg_postal:client:routeVehicleRegistered', src, vehicleNetId, plate)
+end)
+
+RegisterNetEvent('acg_postal:server:routeSpawnFailed', function()
+    clearRoute(source, 'client_vehicle_spawn_failed')
+end)
+
+RegisterNetEvent('acg_postal:server:cancelRoute', function(reason)
+    local allowedReasons = {
+        route_generation_failed = true,
+        explicit_player_cancellation = true
+    }
+    local clearReason = allowedReasons[reason] and reason or 'client_requested_route_cancel'
+    clearRoute(source, clearReason)
 end)
 
 RegisterNetEvent('acg_postal:server:completeDelivery', function(stopNumber)
     local src = source
     local route = ActiveRoutes[src]
 
-    if not route then
-        TriggerClientEvent('acg_postal:client:deliveryRejected', src, 'You do not have an active postal route.')
+    if not route or not route.vehicleRegistered then
+        TriggerClientEvent('acg_postal:client:deliveryRejected', src, 'You do not have an active registered postal route.')
         return
     end
 
@@ -369,8 +152,7 @@ RegisterNetEvent('acg_postal:server:completeDelivery', function(stopNumber)
         route.currentStop = route.currentStop + 1
     end
 
-    debugPrint(('Package delivered by player %s'):format(src))
-    debugPrint(('Server accepted delivery %s/%s'):format(completedStop, route.totalStops))
+    debugPrint(('Server accepted delivery %s/%s for player %s'):format(completedStop, route.totalStops, src))
     TriggerClientEvent(
         'acg_postal:client:deliveryAccepted',
         src,
@@ -380,17 +162,12 @@ RegisterNetEvent('acg_postal:server:completeDelivery', function(stopNumber)
     )
 end)
 
-RegisterNetEvent('acg_postal:server:returnVehicle', function(vehicleNetId)
+RegisterNetEvent('acg_postal:server:returnVehicle', function(vehicleNetId, plate)
     local src = source
     local route = ActiveRoutes[src]
 
-    if not route or not route.vehicleNetId then
+    if not route or not route.vehicleRegistered then
         TriggerClientEvent('acg_postal:client:returnDenied', src, 'You do not have an active postal vehicle.')
-        return
-    end
-
-    if type(vehicleNetId) ~= 'number' or vehicleNetId ~= route.vehicleNetId then
-        TriggerClientEvent('acg_postal:client:returnDenied', src, 'This is not your assigned postal vehicle.')
         return
     end
 
@@ -399,29 +176,23 @@ RegisterNetEvent('acg_postal:server:returnVehicle', function(vehicleNetId)
         return
     end
 
-    local vehicle = ResolvePostalVehicleEntity(route.vehicleNetId)
-
-    if vehicle == 0 then
-        TriggerClientEvent('acg_postal:client:returnDenied', src, 'The postal vehicle is temporarily unavailable. Try again.')
+    if type(vehicleNetId) ~= 'number' or vehicleNetId ~= route.vehicleNetId then
+        TriggerClientEvent('acg_postal:client:returnDenied', src, 'This is not your assigned postal vehicle.')
         return
     end
 
-    if DoesEntityExist(vehicle) then
-        local vehicleCoords = GetEntityCoords(vehicle)
-
-        if #(vehicleCoords - Config.Depot) > Config.ReturnDistance then
-            TriggerClientEvent('acg_postal:client:returnDenied', src, 'Bring your postal vehicle closer to the depot.')
-            return
-        end
+    if normalizePlate(plate) ~= route.plate then
+        TriggerClientEvent('acg_postal:client:returnDenied', src, 'The postal vehicle plate does not match your route.')
+        return
     end
 
-    debugPrint(('Vehicle returned by player %s (network ID %s)'):format(src, vehicleNetId))
-    deleteRouteVehicle(src, 'vehicle_returned')
+    clearRoute(src, 'vehicle_returned')
+    debugPrint(('Vehicle return approved player=%s netId=%s plate=%s'):format(src, vehicleNetId, route.plate))
     TriggerClientEvent('acg_postal:client:returnApproved', src, vehicleNetId)
 end)
 
 AddEventHandler('playerDropped', function()
-    deleteRouteVehicle(source, 'player_dropped')
+    clearRoute(source, 'player_dropped')
 end)
 
 AddEventHandler('onResourceStop', function(resourceName)
@@ -429,21 +200,5 @@ AddEventHandler('onResourceStop', function(resourceName)
         return
     end
 
-    local playerIds = {}
-    local seenPlayerIds = {}
-
-    for playerId in pairs(ActiveRoutes) do
-        playerIds[#playerIds + 1] = playerId
-        seenPlayerIds[playerId] = true
-    end
-
-    for playerId in pairs(PendingRoutes) do
-        if not seenPlayerIds[playerId] then
-            playerIds[#playerIds + 1] = playerId
-        end
-    end
-
-    for _, playerId in ipairs(playerIds) do
-        deleteRouteVehicle(playerId, 'resource_stopping')
-    end
+    ActiveRoutes = {}
 end)
