@@ -21,6 +21,7 @@ local vehicleExistenceCheckPending = false
 
 local carryAnimDict = 'anim@heists@box_carry@'
 local carryAnimName = 'idle'
+local ResolveRouteVehicle
 
 local function debugPrint(message)
     if Config.Debug then
@@ -71,11 +72,6 @@ local function runInitializationOperation(label, vehicle, operation)
     end
 
     debugPrint(('AFTER %s entity exists=%s'):format(label, tostring(entityExists(vehicle))))
-
-    CreateThread(function()
-        Wait(1000)
-        debugPrint(('1000ms AFTER %s entity exists=%s'):format(label, tostring(entityExists(vehicle))))
-    end)
 end
 
 local function SetPostalVehicleFuel(vehicle)
@@ -330,20 +326,24 @@ local function ClearRouteState(reason)
     vehicleExistenceCheckPending = false
 end
 
-local function startVehicleDiagnostic(vehicle, networkId)
+local function logRouteVehicleStatus(networkId)
+    local vehicle = ResolveRouteVehicle()
+
+    debugPrint(('Route vehicle status: %s entity=%s netId=%s'):format(
+        vehicle and 'RESOLVED' or 'UNRESOLVED',
+        tostring(vehicle or 0),
+        tostring(networkId)
+    ))
+end
+
+local function startVehicleDiagnostic(networkId)
     CreateThread(function()
         Wait(5000)
-
-        local status = vehicle ~= 0 and DoesEntityExist(vehicle) and 'EXISTS' or 'MISSING'
-        debugPrint(('5-second client vehicle check: %s entity=%s netId=%s'):format(
-            status,
-            tostring(vehicle),
-            tostring(networkId)
-        ))
+        logRouteVehicleStatus(networkId)
     end)
 end
 
-local function ResolveRouteVehicle()
+ResolveRouteVehicle = function()
     if routeVehicle and routeVehicle ~= 0 and DoesEntityExist(routeVehicle) then
         return routeVehicle
     end
@@ -423,22 +423,22 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
         return
     end
 
+    routeVehicle = nil
+    routeVehicleNetId = vehicleNetId
     local timeout = GetGameTimer() + 10000
-    local vehicle = 0
+    local vehicle = nil
 
     while GetGameTimer() < timeout do
-        if NetworkDoesEntityExistWithNetworkId(vehicleNetId) then
-            vehicle = NetToVeh(vehicleNetId)
+        vehicle = ResolveRouteVehicle()
 
-            if vehicle ~= 0 and DoesEntityExist(vehicle) then
-                break
-            end
+        if vehicle then
+            break
         end
 
         Wait(100)
     end
 
-    if vehicle == 0 or not DoesEntityExist(vehicle) then
+    if not vehicle then
         debugPrint(('Failed to resolve server vehicle netId=%s'):format(vehicleNetId))
         TriggerServerEvent('acg_postal:server:cancelRoute', 'vehicle_resolution_failed')
         ClearRouteState('vehicle_resolution_failed')
@@ -458,13 +458,10 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
     local plateTimeout = GetGameTimer() + 5000
 
     while actualPlate ~= expectedPlate and GetGameTimer() < plateTimeout do
-        if not DoesEntityExist(vehicle) then
-            break
-        end
-
         Wait(100)
+        vehicle = ResolveRouteVehicle()
 
-        if DoesEntityExist(vehicle) then
+        if vehicle then
             actualPlate = NormalizePlate(GetVehicleNumberPlateText(vehicle))
         end
     end
@@ -478,7 +475,9 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
         ))
     end
 
-    if not DoesEntityExist(vehicle) then
+    vehicle = ResolveRouteVehicle()
+
+    if not vehicle then
         debugPrint(('Postal vehicle disappeared while waiting for plate replication netId=%s'):format(vehicleNetId))
         TriggerServerEvent('acg_postal:server:cancelRoute', 'plate_replication_entity_lost')
         ClearRouteState('plate_replication_entity_lost')
@@ -487,7 +486,6 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
     end
 
     routeVehicle = vehicle
-    routeVehicleNetId = vehicleNetId
     onDuty = true
     routeRequestPending = false
 
@@ -527,7 +525,7 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
         debugPrint('Diagnostic mode: leaving the server-created vehicle untouched')
     end
 
-    startVehicleDiagnostic(vehicle, vehicleNetId)
+    startVehicleDiagnostic(vehicleNetId)
 
     if not generateRouteStops() then
         TriggerServerEvent('acg_postal:server:cancelRoute', 'route_generation_failed')
@@ -535,6 +533,8 @@ RegisterNetEvent('acg_postal:client:routeVehicleCreated', function(vehicleNetId,
         QBCore.Functions.Notify('No postal delivery locations are configured.', 'error')
         return
     end
+
+    logRouteVehicleStatus(vehicleNetId)
 
     debugPrint(('Server postal vehicle resolved: entity=%s netId=%s plate=%s'):format(vehicle, vehicleNetId, plate))
     QBCore.Functions.Notify('Postal route started. Return the vehicle to this depot when finished.', 'success')

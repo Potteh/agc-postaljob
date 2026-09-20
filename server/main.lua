@@ -55,8 +55,29 @@ local function isVehicleSpawnClear()
 end
 
 
-local function DeletePostalVehicle(vehicle, vehicleNetId, reason)
-    local exists = vehicle ~= nil and vehicle ~= 0 and DoesEntityExist(vehicle)
+local function ResolvePostalVehicleEntity(vehicleNetId)
+    if type(vehicleNetId) ~= 'number' or vehicleNetId <= 0 then
+        return 0
+    end
+
+    local vehicle = NetworkGetEntityFromNetworkId(vehicleNetId)
+
+    if vehicle == 0 or not DoesEntityExist(vehicle) then
+        return 0
+    end
+
+    return vehicle
+end
+
+
+local function DeletePostalVehicle(vehicleNetId, fallbackVehicle, reason)
+    local vehicle = ResolvePostalVehicleEntity(vehicleNetId)
+
+    if vehicle == 0 and fallbackVehicle and fallbackVehicle ~= 0 and DoesEntityExist(fallbackVehicle) then
+        vehicle = fallbackVehicle
+    end
+
+    local exists = vehicle ~= 0 and DoesEntityExist(vehicle)
 
     debugPrint(('SERVER DELETE POSTAL VEHICLE\nreason=%s\nentity=%s\nnetId=%s\nexists=%s'):format(
         tostring(reason),
@@ -78,14 +99,14 @@ local function deleteRouteVehicle(playerId, reason)
         local pendingRoute = PendingRoutes[playerId]
 
         if pendingRoute and pendingRoute.vehicle and pendingRoute.vehicle ~= 0 then
-            DeletePostalVehicle(pendingRoute.vehicle, 0, reason)
+            DeletePostalVehicle(0, pendingRoute.vehicle, reason)
         end
 
         clearRoute(playerId, reason)
         return
     end
 
-    DeletePostalVehicle(route.vehicle, route.vehicleNetId, reason)
+    DeletePostalVehicle(route.vehicleNetId, nil, reason)
     clearRoute(playerId, reason)
 end
 
@@ -93,14 +114,14 @@ end
 local function failVehicleCreation(playerId, vehicle, message, debugMessage)
     debugPrint(debugMessage)
 
-    DeletePostalVehicle(vehicle, 0, 'spawn_failure')
+    DeletePostalVehicle(0, vehicle, 'spawn_failure')
 
     clearRoute(playerId, 'spawn_failure')
     TriggerClientEvent('acg_postal:client:routeDenied', playerId, message)
 end
 
 
-local function startVehicleDiagnostic(playerId, vehicle, vehicleNetId)
+local function startVehicleDiagnostic(playerId, vehicleNetId)
     local checks = {
         { delay = 1000, label = '1-second' },
         { delay = 5000, label = '5-second' },
@@ -113,11 +134,12 @@ local function startVehicleDiagnostic(playerId, vehicle, vehicleNetId)
         local label = check.label
 
         SetTimeout(delay, function()
-            local exists = vehicle ~= 0 and DoesEntityExist(vehicle)
+            local vehicle = ResolvePostalVehicleEntity(vehicleNetId)
+            local exists = vehicle ~= 0
 
-            debugPrint(('%s SERVER check: %s entity=%s netId=%s player=%s'):format(
+            debugPrint(('%s SERVER network check: %s entity=%s netId=%s player=%s'):format(
                 label,
-                exists and 'EXISTS' or 'MISSING',
+                exists and 'RESOLVED' or 'UNRESOLVED',
                 vehicle,
                 vehicleNetId,
                 playerId
@@ -227,7 +249,7 @@ RegisterNetEvent('acg_postal:server:requestRoute', function()
         Wait(50)
     end
 
-    if not vehicleNetId or vehicleNetId <= 0 or vehicleNetId >= 65534 or not DoesEntityExist(vehicle) then
+    if not vehicleNetId or vehicleNetId <= 0 or vehicleNetId >= 65534 then
         failVehicleCreation(
             src,
             vehicle,
@@ -254,7 +276,6 @@ RegisterNetEvent('acg_postal:server:requestRoute', function()
     local totalStops = math.max(1, math.floor(tonumber(Config.DeliveriesPerRoute) or 1))
 
     ActiveRoutes[src] = {
-        vehicle = vehicle,
         vehicleNetId = vehicleNetId,
         plate = plate,
         currentStop = 1,
@@ -265,7 +286,7 @@ RegisterNetEvent('acg_postal:server:requestRoute', function()
 
     debugPrint(('Postal plate: %s'):format(plate))
     debugPrint(('Sending postal vehicle to player %s'):format(src))
-    startVehicleDiagnostic(src, vehicle, vehicleNetId)
+    startVehicleDiagnostic(src, vehicleNetId)
     TriggerClientEvent('acg_postal:client:routeVehicleCreated', src, vehicleNetId, plate)
 end)
 
@@ -294,23 +315,30 @@ RegisterNetEvent('acg_postal:server:checkRouteVehicle', function()
         return
     end
 
-    local vehicleExists = route.vehicle
-        and route.vehicle ~= 0
-        and DoesEntityExist(route.vehicle)
-        and GetEntityHealth(route.vehicle) > 0
+    local vehicle = ResolvePostalVehicleEntity(route.vehicleNetId)
+    local vehicleExists = vehicle ~= 0 and GetEntityHealth(vehicle) > 0
 
     if vehicleExists then
         TriggerClientEvent('acg_postal:client:routeVehicleExists', src, route.vehicleNetId)
         return
     end
 
-    deleteRouteVehicle(src, 'server_confirmed_vehicle_lost')
-    TriggerClientEvent(
-        'acg_postal:client:routeCancelled',
+    if vehicle ~= 0 then
+        deleteRouteVehicle(src, 'server_confirmed_vehicle_destroyed')
+        TriggerClientEvent(
+            'acg_postal:client:routeCancelled',
+            src,
+            'server_confirmed_vehicle_destroyed',
+            'Your postal vehicle has been destroyed. Return to the depot to start a new route.'
+        )
+        return
+    end
+
+    debugPrint(('Route vehicle network ID is currently unresolved; keeping route active player=%s netId=%s'):format(
         src,
-        'server_confirmed_vehicle_lost',
-        'Your postal vehicle has been lost. Return to the depot to start a new route.'
-    )
+        route.vehicleNetId
+    ))
+    TriggerClientEvent('acg_postal:client:routeVehicleExists', src, route.vehicleNetId)
 end)
 
 RegisterNetEvent('acg_postal:server:completeDelivery', function(stopNumber)
@@ -371,9 +399,14 @@ RegisterNetEvent('acg_postal:server:returnVehicle', function(vehicleNetId)
         return
     end
 
-    local vehicle = route.vehicle
+    local vehicle = ResolvePostalVehicleEntity(route.vehicleNetId)
 
-    if vehicle and vehicle ~= 0 and DoesEntityExist(vehicle) then
+    if vehicle == 0 then
+        TriggerClientEvent('acg_postal:client:returnDenied', src, 'The postal vehicle is temporarily unavailable. Try again.')
+        return
+    end
+
+    if DoesEntityExist(vehicle) then
         local vehicleCoords = GetEntityCoords(vehicle)
 
         if #(vehicleCoords - Config.Depot) > Config.ReturnDistance then
